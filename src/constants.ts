@@ -10,6 +10,29 @@ export const WORKSPACE_CENTER = WORKSPACE_SIZE / 2;
 export const MIN_ZOOM = 0.1;
 export const MAX_ZOOM = 8;
 
+export type Tool =
+	| "pencil"
+	| "eraser"
+	| "select"
+	| "pan"
+	| "rectangle"
+	| "ellipse"
+	| "triangle"
+	| "arrow"
+	| "text";
+export const DEFAULT_TOOL: Tool = "pencil";
+
+export const SHAPE_TOOLS: ReadonlySet<Tool> = new Set(["rectangle", "ellipse", "triangle", "arrow"]);
+
+// Screen-pixel radii for hit-testing; divided by the current zoom so the
+// effective canvas-space radius stays visually constant as you zoom.
+export const ERASE_RADIUS_PX = 10;
+export const SELECT_HIT_RADIUS_PX = 6;
+
+// Text tool reuses the pencil size buttons (S/M/L) for font size, scaled up
+// by this factor -- a stroke width of 2-10px isn't legible as text size.
+export const TEXT_SIZE_MULTIPLIER = 6;
+
 // Saved/embedded files are cropped to the bounding box of the strokes, plus
 // this much breathing room on each side.
 export const CROP_PADDING = 20;

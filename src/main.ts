@@ -1,10 +1,25 @@
 import { MarkdownPostProcessorContext, Notice, Plugin, TFile, moment, setIcon } from "obsidian";
 import { DrawingView } from "./DrawingView";
 import { EMPTY_SVG, VIEW_TYPE_DRAWING } from "./constants";
+import { registerIcons } from "./icons";
+
+export interface QuickSketchSettings {
+	/** Hex colors the user has added to the palette via the picker. */
+	customColors: string[];
+}
+
+const DEFAULT_SETTINGS: QuickSketchSettings = {
+	customColors: [],
+};
 
 export default class QuickSketchPlugin extends Plugin {
+	settings: QuickSketchSettings = { ...DEFAULT_SETTINGS };
+
 	async onload(): Promise<void> {
-		this.registerView(VIEW_TYPE_DRAWING, (leaf) => new DrawingView(leaf));
+		registerIcons();
+		await this.loadSettings();
+
+		this.registerView(VIEW_TYPE_DRAWING, (leaf) => new DrawingView(leaf, this));
 
 		this.addRibbonIcon("pencil", "New drawing", () => {
 			void this.createNewDrawing();
@@ -27,6 +42,16 @@ export default class QuickSketchPlugin extends Plugin {
 		for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_DRAWING)) {
 			leaf.detach();
 		}
+	}
+
+	async loadSettings(): Promise<void> {
+		const loaded = (await this.loadData()) as Partial<QuickSketchSettings> | null;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded ?? {});
+		if (!Array.isArray(this.settings.customColors)) this.settings.customColors = [];
+	}
+
+	async saveSettings(): Promise<void> {
+		await this.saveData(this.settings);
 	}
 
 	private async createNewDrawing(): Promise<void> {
@@ -56,7 +81,7 @@ export default class QuickSketchPlugin extends Plugin {
 			const state = leaf.view.getState() as { file?: string };
 			return state?.file === file.path;
 		});
-		const leaf = existing ?? this.app.workspace.getLeaf("split", "vertical");
+		const leaf = existing ?? this.app.workspace.getLeaf("tab");
 		await leaf.setViewState({
 			type: VIEW_TYPE_DRAWING,
 			active: true,
