@@ -1,0 +1,91 @@
+.quick-sketch-view {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	padding: var(--size-4-2);
+	gap: var(--size-4-2);
+}
+
+.quick-sketch-toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: var(--size-4-3);
+}
+
+.quick-sketch-group {
+	display: flex;
+	align-items: center;
+	gap: var(--size-4-1);
+}
+
+.quick-sketch-size-btn {
+	width: 2em;
+}
+
+.quick-sketch-size-btn.is-active {
+	background-color: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+.quick-sketch-swatch {
+	/* !important guards against Obsidian's mobile touch-target base styles
+	   (min-height without a matching min-width, etc.) stretching this into
+	   an oval instead of a circle. */
+	box-sizing: border-box !important;
+	width: 22px !important;
+	height: 22px !important;
+	min-width: 22px !important;
+	min-height: 22px !important;
+	aspect-ratio: 1 / 1;
+	padding: 0;
+	border-radius: 50%;
+	border: 2px solid var(--background-modifier-border);
+	cursor: pointer;
+	flex-shrink: 0;
+}
+
+.quick-sketch-swatch.is-active {
+	border-color: var(--text-normal);
+}
+
+.quick-sketch-canvas-wrap {
+	flex: 1;
+	overflow: hidden;
+	position: relative;
+}
+
+.quick-sketch-canvas {
+	display: block;
+	/* Pan/zoom is handled entirely in JS (pointer + wheel), for both touch and
+	   pen/mouse -- touch-action: none stops the browser from ever hijacking a
+	   stylus contact as its own pan/zoom gesture. */
+	touch-action: none;
+	cursor: crosshair;
+	background-color: #ffffff;
+}
+
+.quick-sketch-embed {
+	position: relative;
+}
+
+.quick-sketch-edit-btn {
+	position: absolute;
+	top: 6px;
+	right: 6px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box !important;
+	width: 28px !important;
+	height: 28px !important;
+	min-width: 28px !important;
+	min-height: 28px !important;
+	aspect-ratio: 1 / 1;
+	padding: 0;
+	border-radius: 50%;
+	background-color: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	box-shadow: var(--shadow-s);
+	cursor: pointer;
+}

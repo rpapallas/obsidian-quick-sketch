@@ -1,0 +1,9 @@
+{
+	"id": "quick-sketch",
+	"name": "Quick Sketch",
+	"version": "0.1.0",
+	"minAppVersion": "0.15.0",
+	"description": "Draw quick freehand sketches, embedded and editable inline in your notes.",
+	"author": "Rafael Papallas",
+	"isDesktopOnly": false
+}
