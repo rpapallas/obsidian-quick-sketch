@@ -1171,12 +1171,19 @@ export class DrawingView extends ItemView {
 	private cloneElements(): SerializedElement[] {
 		return this.elements.map((elem) => {
 			if (elem.kind === "freehand") {
+				// Points arrays are never mutated in place once an element is
+				// finalized (a selection drag reassigns a brand-new array rather
+				// than pushing into this one), so sharing the reference is safe
+				// and avoids an O(total points ever drawn) deep clone on every
+				// single pointerdown -- with a lot of handwritten strokes on
+				// screen, that clone was slow enough to be felt as input lag
+				// (e.g. the dot of an "i" not registering right after its stem).
 				return {
 					id: elem.id,
 					kind: "freehand",
 					color: elem.color,
 					size: elem.size,
-					points: elem.points.map((p) => ({ x: p.x, y: p.y })),
+					points: elem.points,
 				};
 			}
 			if (elem.kind === "text") {
@@ -1340,15 +1347,22 @@ export class DrawingView extends ItemView {
 	 * loaded, so a plain vault.modify() leaves the old drawing on screen
 	 * anywhere it's embedded until the note is reopened. getResourcePath()
 	 * includes the file's mtime in the URL, so re-reading it after the save
-	 * and pushing it onto every matching embed's <img> forces a refetch. */
+	 * and pushing it onto every matching embed's <img> forces a refetch.
+	 *
+	 * Matching is done on the img's *current* resource URL (stripped of its
+	 * mtime query) rather than by re-resolving the embed's link text --
+	 * resolving a link needs the source note's own path for context (relative
+	 * links resolve differently per-note), which isn't available here since
+	 * embeds across every open note are scanned at once. Comparing resource
+	 * URLs sidesteps that: the same file always maps to the same base URL
+	 * regardless of how any particular note linked to it. */
 	private refreshEmbedsForFile(file: TFile): void {
 		const resourcePath = this.app.vault.getResourcePath(file);
-		document.querySelectorAll<HTMLElement>(".internal-embed").forEach((embedEl) => {
-			const src = embedEl.getAttribute("src");
-			if (!src) return;
-			const target = this.app.metadataCache.getFirstLinkpathDest(src, "");
-			if (!target || target.path !== file.path) return;
-			embedEl.querySelector("img")?.setAttribute("src", resourcePath);
+		const base = resourcePath.split("?")[0];
+		document.querySelectorAll<HTMLImageElement>(".internal-embed img").forEach((img) => {
+			const src = img.getAttribute("src");
+			if (!src || src.split("?")[0] !== base) return;
+			img.setAttribute("src", resourcePath);
 		});
 	}
 
@@ -1680,14 +1694,26 @@ export class DrawingView extends ItemView {
 		});
 	}
 
-	/** Resets pan/zoom so the drawing (or its center, if empty) is in view. */
+	/** Resets zoom to 100% and recenters the viewport on the drawing's actual
+	 * content (its bounding box center), or the workspace's fixed center if
+	 * there's nothing drawn yet. Centering on the fixed workspace center
+	 * unconditionally would strand the viewport away from your work once the
+	 * content has drifted from that point -- which reads as the drawing
+	 * "moving away" and any new strokes landing in a big empty gap next to it. */
 	private centerView(): void {
 		requestAnimationFrame(() => {
 			const wrap = this.canvasWrapEl;
 			if (!wrap) return;
 			this.zoom = 1;
-			this.panX = wrap.clientWidth / 2 - WORKSPACE_CENTER * this.zoom;
-			this.panY = wrap.clientHeight / 2 - WORKSPACE_CENTER * this.zoom;
+			let centerX = WORKSPACE_CENTER;
+			let centerY = WORKSPACE_CENTER;
+			if (this.elements.length > 0) {
+				const bbox = this.elementsGroup.getBBox();
+				centerX = bbox.x + bbox.width / 2;
+				centerY = bbox.y + bbox.height / 2;
+			}
+			this.panX = wrap.clientWidth / 2 - centerX * this.zoom;
+			this.panY = wrap.clientHeight / 2 - centerY * this.zoom;
 			this.applyTransform();
 		});
 	}

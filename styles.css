@@ -52,7 +52,21 @@
 }
 
 .quick-sketch-size-btn {
-	width: 2em;
+	/* Same !important guard as .quick-sketch-btn/.quick-sketch-swatch below --
+	   without it, Obsidian's mobile touch-target base styles (min-height with
+	   no matching min-width) stretch this into an oval/pill on iPad instead
+	   of a small square button matching the rest of the toolbar. */
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box !important;
+	width: 30px !important;
+	height: 30px !important;
+	min-width: 30px !important;
+	min-height: 30px !important;
+	padding: 0;
+	border-radius: var(--radius-s);
+	cursor: pointer;
 }
 
 .quick-sketch-size-btn.is-active {
@@ -113,6 +127,15 @@
 	flex: 1;
 	overflow: hidden;
 	position: relative;
+	/* Stop WebKit/iPadOS from treating a pencil touch-and-hold as the start of
+	   a text-selection/long-press gesture -- that recognizer competing with
+	   our own pointer handling is what shows up as a delay before a quick
+	   re-touch (e.g. lifting the pencil after the stem of an "i" and tapping
+	   again for the dot) gets delivered as a new pointerdown. */
+	-webkit-touch-callout: none;
+	-webkit-user-select: none;
+	user-select: none;
+	-webkit-tap-highlight-color: transparent;
 }
 
 .quick-sketch-canvas {
@@ -196,7 +219,15 @@
 }
 
 .quick-sketch-embed {
+	/* display must be set explicitly: this class lands on an inline
+	   <span> (Obsidian's .internal-embed), and an inline element as the
+	   containing block for an absolutely-positioned child is inconsistent
+	   across engines -- WebKit/iPadOS in particular can resolve it against
+	   the wrong fragment box, which is what put the edit button at the
+	   bottom-right instead of the top-right. */
+	display: inline-block;
 	position: relative;
+	line-height: 0;
 }
 
 .quick-sketch-edit-btn {
