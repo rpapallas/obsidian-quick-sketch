@@ -12,6 +12,10 @@ const LUCIDE_24: Record<string, string> = {
 		<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" />
 		<path d="m15 5 4 4" />
 	`,
+	"quick-sketch-highlighter": `
+		<path d="m9 11-6 6v3h9l3-3" />
+		<path d="m22 12-4.6 4.6a2 2 0 0 1-2.8 0l-5.2-5.2a2 2 0 0 1 0-2.8L14 4" />
+	`,
 	"quick-sketch-eraser": `
 		<path d="M21 21H8a2 2 0 0 1-1.42-.587l-3.994-3.999a2 2 0 0 1 0-2.828l10-10a2 2 0 0 1 2.829 0l5.999 6a2 2 0 0 1 0 2.828L12.834 21" />
 		<path d="m5.082 11.09 8.828 8.828" />
@@ -108,6 +112,7 @@ export function registerIcons(): void {
 
 export const ICON = {
 	pencil: "quick-sketch-pencil",
+	highlighter: "quick-sketch-highlighter",
 	eraser: "quick-sketch-eraser",
 	select: "quick-sketch-select",
 	hand: "quick-sketch-hand",

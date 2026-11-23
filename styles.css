@@ -35,7 +35,9 @@
 	height: 30px !important;
 	min-width: 30px !important;
 	min-height: 30px !important;
-	padding: 0;
+	/* !important: Obsidian's mobile button padding otherwise wins, and with
+	   border-box a box can't be narrower than its padding -- stretching it. */
+	padding: 0 !important;
 	border-radius: var(--radius-s);
 	cursor: pointer;
 }
@@ -64,7 +66,9 @@
 	height: 30px !important;
 	min-width: 30px !important;
 	min-height: 30px !important;
-	padding: 0;
+	/* !important: Obsidian's mobile button padding otherwise wins, and with
+	   border-box a box can't be narrower than its padding -- stretching it. */
+	padding: 0 !important;
 	border-radius: var(--radius-s);
 	cursor: pointer;
 }
@@ -75,24 +79,47 @@
 }
 
 .quick-sketch-swatch {
-	/* !important guards against Obsidian's mobile touch-target base styles
-	   (min-height without a matching min-width, etc.) stretching this into
-	   an oval instead of a circle. */
+	/* The visible circle is drawn by ::before at a fixed pixel size, not by
+	   the button box itself: on iPad, Obsidian's mobile button styles still
+	   reshape the box (appearance, padding, min sizes) and border-radius: 50%
+	   on a non-square box is an oval. A pseudo-element isn't targeted by those
+	   styles, so it stays a true circle whatever happens to the box. */
 	position: relative;
+	display: inline-block;
+	flex: 0 0 auto;
 	box-sizing: border-box !important;
-	width: 22px !important;
-	height: 22px !important;
-	min-width: 22px !important;
-	min-height: 22px !important;
-	aspect-ratio: 1 / 1;
-	padding: 0;
-	border-radius: 50%;
-	border: 2px solid var(--background-modifier-border);
+	width: 24px !important;
+	height: 24px !important;
+	min-width: 24px !important;
+	min-height: 24px !important;
+	max-width: 24px !important;
+	max-height: 24px !important;
+	margin: 0;
+	padding: 0 !important;
+	border: none !important;
+	background: transparent !important;
+	box-shadow: none !important;
+	-webkit-appearance: none;
+	appearance: none;
 	cursor: pointer;
-	flex-shrink: 0;
 }
 
-.quick-sketch-swatch.is-active {
+.quick-sketch-swatch::before {
+	content: "";
+	position: absolute;
+	top: 50%;
+	left: 50%;
+	width: 22px;
+	height: 22px;
+	transform: translate(-50%, -50%);
+	box-sizing: border-box;
+	border-radius: 50%;
+	border: 2px solid var(--background-modifier-border);
+	background-color: var(--qs-swatch-color, transparent);
+	pointer-events: none;
+}
+
+.quick-sketch-swatch.is-active::before {
 	border-color: var(--text-normal);
 }
 
@@ -136,6 +163,10 @@
 	-webkit-user-select: none;
 	user-select: none;
 	-webkit-tap-highlight-color: transparent;
+	/* The listeners live on this wrapper, so it needs touch-action too --
+	   otherwise WebKit's double-tap-zoom delay can still apply to contacts
+	   that land on it (e.g. when zoomed out past the canvas edge). */
+	touch-action: none;
 }
 
 .quick-sketch-canvas {
@@ -147,7 +178,8 @@
 	background-color: #ffffff;
 }
 
-.quick-sketch-canvas-wrap.tool-pencil .quick-sketch-canvas {
+.quick-sketch-canvas-wrap.tool-pencil .quick-sketch-canvas,
+.quick-sketch-canvas-wrap.tool-highlighter .quick-sketch-canvas {
 	cursor: crosshair;
 }
 
@@ -231,6 +263,7 @@
 }
 
 .quick-sketch-edit-btn {
+	/* Circle drawn by ::before for the same reason as .quick-sketch-swatch. */
 	position: absolute;
 	top: 6px;
 	right: 6px;
@@ -242,11 +275,51 @@
 	height: 28px !important;
 	min-width: 28px !important;
 	min-height: 28px !important;
-	aspect-ratio: 1 / 1;
-	padding: 0;
+	max-width: 28px !important;
+	max-height: 28px !important;
+	margin: 0;
+	padding: 0 !important;
+	border: none !important;
+	background: transparent !important;
+	box-shadow: none !important;
+	-webkit-appearance: none;
+	appearance: none;
+	cursor: pointer;
+}
+
+.quick-sketch-edit-btn::before {
+	content: "";
+	position: absolute;
+	top: 50%;
+	left: 50%;
+	width: 28px;
+	height: 28px;
+	transform: translate(-50%, -50%);
+	box-sizing: border-box;
 	border-radius: 50%;
 	background-color: var(--background-primary);
 	border: 1px solid var(--background-modifier-border);
 	box-shadow: var(--shadow-s);
-	cursor: pointer;
+	pointer-events: none;
+}
+
+.quick-sketch-edit-btn svg {
+	position: relative;
+	z-index: 1;
+}
+
+.quick-sketch-diag {
+	position: absolute;
+	top: 8px;
+	left: 8px;
+	z-index: 10;
+	pointer-events: none;
+	white-space: pre;
+	font-family: var(--font-monospace);
+	font-size: 11px;
+	line-height: 1.35;
+	padding: 6px 8px;
+	border-radius: 6px;
+	background: rgba(0, 0, 0, 0.72);
+	color: #fff;
 }

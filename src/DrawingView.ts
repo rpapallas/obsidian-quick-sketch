@@ -9,6 +9,9 @@ import {
 	EMPTY_EXPORT_WIDTH,
 	EMPTY_SVG,
 	ERASE_RADIUS_PX,
+	HIGHLIGHT_COLORS,
+	HIGHLIGHT_OPACITY,
+	HIGHLIGHT_SIZE_MULTIPLIER,
 	MAX_ZOOM,
 	MIN_ZOOM,
 	SELECT_HIT_RADIUS_PX,
@@ -25,7 +28,40 @@ import { ICON } from "./icons";
 import type QuickSketchPlugin from "./main";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
-const SAVE_DEBOUNCE_MS = 800;
+// Autosave waits for a real pause: a save (serializing the SVG, writing the
+// file -- possibly to iCloud -- and refreshing embeds in open notes) is main-
+// thread work, and with a short debounce it lands in the natural gaps between
+// words while handwriting, delaying the next stroke's ink.
+const SAVE_DEBOUNCE_MS = 2000;
+
+// Palm rejection: while handwriting, the resting hand reaches us as ordinary
+// "touch" pointers, which would otherwise pan (one contact) or pinch-zoom
+// (two) the canvas between strokes -- and a zoom change makes WebKit
+// re-rasterize the whole huge SVG, stalling the next stroke's ink. Touches
+// are ignored while the pen is down and for this long after it was last used.
+const PALM_GUARD_MS = 1500;
+
+/** Input-latency counters shown by the "Toggle input diagnostics" command. */
+interface InputDiagnostics {
+	el: HTMLElement;
+	penDowns: number;
+	lastDeliveryMs: number;
+	maxDeliveryMs: number;
+	lastLiftGapMs: number;
+	lastDownToMoveMs: number;
+	awaitingFirstMove: number | null;
+	maxDownHandlerMs: number;
+	maxUpHandlerMs: number;
+	longFrames: number;
+	maxFrameMs: number;
+	lastFrameAt: number;
+	rafId: number;
+	touchesAccepted: number;
+	touchesRejected: number;
+	missedPointerUps: number;
+	lastSaveMs: number;
+	lastPenUpAt: number;
+}
 
 interface Point {
 	x: number;
@@ -42,6 +78,7 @@ interface FreehandElement {
 	color: string;
 	size: number;
 	points: Point[];
+	highlight?: boolean;
 }
 
 interface ShapeElement {
@@ -76,7 +113,7 @@ type GeometrySnapshot =
 
 /** Serialized form used for undo/redo snapshots -- geometry only, no live DOM refs. */
 type SerializedElement =
-	| { id: string; kind: "freehand"; color: string; size: number; points: Point[] }
+	| { id: string; kind: "freehand"; color: string; size: number; points: Point[]; highlight?: boolean }
 	| { id: string; kind: ShapeKind; color: string; size: number; x0: number; y0: number; x1: number; y1: number }
 	| { id: string; kind: "text"; color: string; size: number; x: number; y: number; text: string };
 
@@ -86,6 +123,7 @@ interface ActiveDrawStroke {
 	pointerId: number;
 	color: string;
 	size: number;
+	highlight: boolean;
 }
 
 interface ActiveShapeDraw {
@@ -221,6 +259,8 @@ export class DrawingView extends ItemView {
 	private elementsGroup!: SVGGElement;
 	private overlayGroup!: SVGGElement;
 	private toolbarEl!: HTMLElement;
+	private inkColorGroup: HTMLElement | null = null;
+	private highlightColorGroup: HTMLElement | null = null;
 	private canvasWrapEl!: HTMLElement;
 	private statusEl!: HTMLElement;
 
@@ -228,6 +268,7 @@ export class DrawingView extends ItemView {
 
 	private tool: Tool = DEFAULT_TOOL;
 	private currentColor = DEFAULT_COLOR;
+	private currentHighlightColor = HIGHLIGHT_COLORS[0];
 	private currentSize = DEFAULT_STROKE_PX;
 
 	private elements: DrawnElement[] = [];
@@ -260,6 +301,8 @@ export class DrawingView extends ItemView {
 	private panY = 0;
 	private zoom = 1;
 	private touchPoints: Map<number, Point> = new Map();
+	private lastPenActivity = 0;
+	private diag: InputDiagnostics | null = null;
 
 	private dirty = false;
 	private saveTimer: number | null = null;
@@ -296,6 +339,7 @@ export class DrawingView extends ItemView {
 	}
 
 	async onClose(): Promise<void> {
+		if (this.diag) this.toggleDiagnostics();
 		window.removeEventListener("keydown", this.onWindowKeyDown);
 		this.cancelTextEditor();
 		if (this.canvasWrapEl) {
@@ -362,7 +406,26 @@ export class DrawingView extends ItemView {
 		canvasWrap.addEventListener("pointerup", this.onPointerUp);
 		canvasWrap.addEventListener("pointercancel", this.onPointerUp);
 		canvasWrap.addEventListener("wheel", this.onWheel, { passive: false });
+
+		// iPadOS/WebKit runs its own gesture recognizers (double-tap zoom, the
+		// text-selection loupe, Scribble) on raw touch events, *independently*
+		// of pointer events -- preventDefault() on pointerdown doesn't stop
+		// them. A natural lift-and-retouch of the Apple Pencil looks like a
+		// double tap, so WebKit holds the new contact while it decides, which
+		// shows up as delayed ink. Cancelling the touch events themselves
+		// (non-passive) opts the canvas out of those recognizers. Pointer
+		// events are still delivered, so drawing/pan/pinch are unaffected.
+		for (const type of ["touchstart", "touchmove", "touchend"] as const) {
+			canvasWrap.addEventListener(type, this.onRawTouch, { passive: false });
+		}
 	}
+
+	private onRawTouch = (evt: TouchEvent): void => {
+		// Leave the inline text editor alone so it can still focus/select.
+		const target = evt.target as HTMLElement | null;
+		if (target?.closest("textarea, input")) return;
+		if (evt.cancelable) evt.preventDefault();
+	};
 
 	private buildToolbar(): void {
 		const tb = this.toolbarEl;
@@ -391,6 +454,13 @@ export class DrawingView extends ItemView {
 
 		const toolGroup = tb.createDiv({ cls: "quick-sketch-group" });
 		makeBtn(toolGroup, "Pencil", ICON.pencil, () => this.setTool("pencil"), () => this.tool === "pencil");
+		makeBtn(
+			toolGroup,
+			"Highlighter",
+			ICON.highlighter,
+			() => this.setTool("highlighter"),
+			() => this.tool === "highlighter"
+		);
 		makeBtn(toolGroup, "Eraser", ICON.eraser, () => this.setTool("eraser"), () => this.tool === "eraser");
 		makeBtn(toolGroup, "Select", ICON.select, () => this.setTool("select"), () => this.tool === "select");
 		makeBtn(toolGroup, "Pan", ICON.hand, () => this.setTool("pan"), () => this.tool === "pan");
@@ -418,14 +488,33 @@ export class DrawingView extends ItemView {
 
 		tb.createDiv({ cls: "quick-sketch-sep" });
 
+		// The highlighter has its own fixed palette; only one of the two color
+		// groups is shown at a time (see updateColorGroupVisibility).
+		const highlightGroup = tb.createDiv({ cls: "quick-sketch-group" });
+		for (const color of HIGHLIGHT_COLORS) {
+			const btn = highlightGroup.createEl("button", {
+				cls: "quick-sketch-swatch",
+				attr: { "aria-label": `Highlight ${color}`, title: color },
+			});
+			btn.style.setProperty("--qs-swatch-color", color);
+			btn.onclick = (evt) => {
+				evt.preventDefault();
+				this.currentHighlightColor = color;
+				this.refreshToolbarState();
+			};
+			this.activeChecks.set(btn, () => this.currentHighlightColor === color);
+		}
+		this.highlightColorGroup = highlightGroup;
+
 		const colorGroup = tb.createDiv({ cls: "quick-sketch-group" });
+		this.inkColorGroup = colorGroup;
 		for (const color of this.allColors()) {
 			const isCustom = !COLORS.includes(color);
 			const btn = colorGroup.createEl("button", {
 				cls: isCustom ? "quick-sketch-swatch quick-sketch-swatch-custom" : "quick-sketch-swatch",
 				attr: { "aria-label": `Color ${color}`, title: isCustom ? `${color} (right-click to remove)` : color },
 			});
-			btn.style.backgroundColor = color;
+			btn.style.setProperty("--qs-swatch-color", color);
 			btn.onclick = (evt) => {
 				evt.preventDefault();
 				this.currentColor = color;
@@ -501,6 +590,7 @@ export class DrawingView extends ItemView {
 		const doneBtn = tb.createEl("button", { text: "Done", cls: "mod-cta quick-sketch-done" });
 		doneBtn.onclick = () => this.done();
 
+		this.updateColorGroupVisibility();
 		this.refreshToolbarState();
 	}
 
@@ -544,6 +634,7 @@ export class DrawingView extends ItemView {
 		const wrap = this.canvasWrapEl;
 		wrap.removeClass(
 			"tool-pencil",
+			"tool-highlighter",
 			"tool-eraser",
 			"tool-select",
 			"tool-pan",
@@ -554,6 +645,41 @@ export class DrawingView extends ItemView {
 			"tool-text"
 		);
 		wrap.addClass(`tool-${this.tool}`);
+		this.updateColorGroupVisibility();
+	}
+
+	private updateColorGroupVisibility(): void {
+		const highlighting = this.tool === "highlighter";
+		this.highlightColorGroup?.toggle(highlighting);
+		this.inkColorGroup?.toggle(!highlighting);
+	}
+
+	/** Applies the shared freehand stroke attributes. Highlight strokes are
+	 * semi-transparent and flagged with data-highlight so they round-trip
+	 * through the saved SVG. */
+	private styleFreehandPath(pathEl: SVGPathElement, color: string, size: number, highlight: boolean): void {
+		pathEl.setAttribute("stroke", color);
+		pathEl.setAttribute("stroke-width", String(size));
+		pathEl.setAttribute("fill", "none");
+		pathEl.setAttribute("stroke-linecap", "round");
+		pathEl.setAttribute("stroke-linejoin", "round");
+		if (highlight) {
+			pathEl.setAttribute("stroke-opacity", String(HIGHLIGHT_OPACITY));
+			pathEl.setAttribute("data-highlight", "true");
+		}
+	}
+
+	/** Highlights always render beneath the ink: they're inserted after the
+	 * last existing highlight but before every other element. Since the
+	 * export copies elementsGroup's children in order, the saved file keeps
+	 * the same layering. */
+	private insertPath(pathEl: SVGPathElement, highlight: boolean): void {
+		if (!highlight) {
+			this.elementsGroup.appendChild(pathEl);
+			return;
+		}
+		const firstInk = Array.from(this.elementsGroup.children).find((c) => !c.hasAttribute("data-highlight"));
+		this.elementsGroup.insertBefore(pathEl, firstInk ?? null);
 	}
 
 	private refreshToolbarState(): void {
@@ -592,6 +718,21 @@ export class DrawingView extends ItemView {
 	}
 
 	private onPointerDown = (evt: PointerEvent): void => {
+		const t0 = performance.now();
+		this.handlePointerDown(evt);
+		if (this.diag && evt.pointerType !== "touch") {
+			const d = this.diag;
+			const now = performance.now();
+			d.penDowns++;
+			d.lastDeliveryMs = Math.max(0, t0 - evt.timeStamp);
+			d.maxDeliveryMs = Math.max(d.maxDeliveryMs, d.lastDeliveryMs);
+			d.lastLiftGapMs = d.lastPenUpAt ? evt.timeStamp - d.lastPenUpAt : 0;
+			d.awaitingFirstMove = evt.timeStamp;
+			d.maxDownHandlerMs = Math.max(d.maxDownHandlerMs, now - t0);
+		}
+	};
+
+	private handlePointerDown(evt: PointerEvent): void {
 		if (evt.pointerType === "touch") {
 			this.onTouchStart(evt);
 			return;
@@ -604,6 +745,15 @@ export class DrawingView extends ItemView {
 			return;
 		}
 		if (evt.pointerType === "mouse" && evt.button !== 0) return;
+
+		if (evt.pointerType === "pen") {
+			this.lastPenActivity = performance.now();
+			// A palm that landed just before the pen shouldn't keep panning.
+			this.cancelTouchGesture();
+		}
+
+		// Never save in the middle of an interaction; onPointerUp reschedules.
+		this.cancelScheduledSave();
 
 		if (this.tool === "pan") {
 			evt.preventDefault();
@@ -631,7 +781,7 @@ export class DrawingView extends ItemView {
 			return;
 		}
 
-		// Pencil tool: a stylus (Apple Pencil reports as "pen") or a mouse draws.
+		// Pencil / highlighter tool: a stylus (Apple Pencil reports as "pen") or a mouse draws.
 		if (this.activeStroke) {
 			// A pointerup/pointercancel was missed for the previous stroke --
 			// a real-world quirk on iPadOS/WebKit where lifting the Apple
@@ -639,6 +789,7 @@ export class DrawingView extends ItemView {
 			// dot of an "i") doesn't always deliver a clean pointerup. Finalize
 			// whatever was drawn so far instead of getting stuck and silently
 			// swallowing every stroke after it.
+			if (this.diag) this.diag.missedPointerUps++;
 			this.finishActiveStroke();
 		}
 		evt.preventDefault();
@@ -646,25 +797,29 @@ export class DrawingView extends ItemView {
 		this.pushUndoSnapshot();
 
 		const p = this.toCanvasPoint(evt);
+		const highlight = this.tool === "highlighter";
+		const color = highlight ? this.currentHighlightColor : this.currentColor;
+		const size = highlight ? this.currentSize * HIGHLIGHT_SIZE_MULTIPLIER : this.currentSize;
 		const pathEl = document.createElementNS(SVG_NS, "path") as SVGPathElement;
-		pathEl.setAttribute("stroke", this.currentColor);
-		pathEl.setAttribute("stroke-width", String(this.currentSize));
-		pathEl.setAttribute("fill", "none");
-		pathEl.setAttribute("stroke-linecap", "round");
-		pathEl.setAttribute("stroke-linejoin", "round");
+		this.styleFreehandPath(pathEl, color, size, highlight);
 		pathEl.setAttribute("d", buildSmoothPath([p]));
-		this.elementsGroup.appendChild(pathEl);
+		this.insertPath(pathEl, highlight);
 
 		this.activeStroke = {
 			pathEl,
 			points: [p],
 			pointerId: evt.pointerId,
-			color: this.currentColor,
-			size: this.currentSize,
+			color,
+			size,
+			highlight,
 		};
-	};
+	}
 
 	private onPointerMove = (evt: PointerEvent): void => {
+		if (this.diag && this.diag.awaitingFirstMove !== null && evt.pointerType !== "touch") {
+			this.diag.lastDownToMoveMs = evt.timeStamp - this.diag.awaitingFirstMove;
+			this.diag.awaitingFirstMove = null;
+		}
 		if (evt.pointerType === "touch") {
 			this.onTouchMove(evt);
 			return;
@@ -706,6 +861,7 @@ export class DrawingView extends ItemView {
 		}
 
 		if (!this.activeStroke || evt.pointerId !== this.activeStroke.pointerId) return;
+		if (evt.pointerType === "pen") this.lastPenActivity = performance.now();
 		const p = this.toCanvasPoint(evt);
 		const last = this.activeStroke.points[this.activeStroke.points.length - 1];
 		const dx = p.x - last.x;
@@ -716,10 +872,24 @@ export class DrawingView extends ItemView {
 	};
 
 	private onPointerUp = (evt: PointerEvent): void => {
+		const t0 = performance.now();
+		this.handlePointerUp(evt);
+		if (this.diag && evt.pointerType !== "touch") {
+			this.diag.lastPenUpAt = evt.timeStamp;
+			this.diag.maxUpHandlerMs = Math.max(this.diag.maxUpHandlerMs, performance.now() - t0);
+		}
+	};
+
+	private handlePointerUp(evt: PointerEvent): void {
 		if (evt.pointerType === "touch") {
 			this.onTouchEnd(evt);
 			return;
 		}
+		if (evt.pointerType === "pen") this.lastPenActivity = performance.now();
+
+		// Restart the autosave countdown that pointerdown paused (handlers
+		// below that change the drawing reschedule it again anyway).
+		if (this.dirty && !this.saveTimer) this.scheduleSave();
 
 		if (this.panDrag && evt.pointerId === this.panDrag.pointerId) {
 			this.releaseCapture(evt.pointerId);
@@ -774,7 +944,7 @@ export class DrawingView extends ItemView {
 
 		if (!this.activeStroke || evt.pointerId !== this.activeStroke.pointerId) return;
 		this.finishActiveStroke();
-	};
+	}
 
 	private finishActiveStroke(): void {
 		if (!this.activeStroke) return;
@@ -787,6 +957,7 @@ export class DrawingView extends ItemView {
 			points: this.activeStroke.points,
 			color: this.activeStroke.color,
 			size: this.activeStroke.size,
+			highlight: this.activeStroke.highlight,
 		});
 		this.activeStroke = null;
 		this.markDirtyAndScheduleSave();
@@ -1065,8 +1236,16 @@ export class DrawingView extends ItemView {
 	// --- Touch: pan with one finger, pinch-zoom with two. Never draws. ---
 
 	private onTouchStart(evt: PointerEvent): void {
-		if (this.touchPoints.size >= 2) return; // ignore a 3rd+ finger
 		evt.preventDefault();
+		const penBusy =
+			this.activeStroke !== null ||
+			performance.now() - this.lastPenActivity < PALM_GUARD_MS;
+		if (penBusy || this.touchPoints.size >= 2) {
+			// Palm while writing (or a 3rd+ finger): ignore entirely.
+			if (this.diag) this.diag.touchesRejected++;
+			return;
+		}
+		if (this.diag) this.diag.touchesAccepted++;
 		this.canvasWrapEl.setPointerCapture(evt.pointerId);
 		this.touchPoints.set(evt.pointerId, this.toWrapPoint(evt));
 	}
@@ -1098,6 +1277,11 @@ export class DrawingView extends ItemView {
 
 		this.touchPoints.set(evt.pointerId, next);
 		this.applyTransform();
+	}
+
+	private cancelTouchGesture(): void {
+		for (const id of this.touchPoints.keys()) this.releaseCapture(id);
+		this.touchPoints.clear();
 	}
 
 	private onTouchEnd(evt: PointerEvent): void {
@@ -1184,6 +1368,7 @@ export class DrawingView extends ItemView {
 					color: elem.color,
 					size: elem.size,
 					points: elem.points,
+					highlight: elem.highlight,
 				};
 			}
 			if (elem.kind === "text") {
@@ -1213,7 +1398,7 @@ export class DrawingView extends ItemView {
 	private restoreElements(snapshot: SerializedElement[]): void {
 		this.elementsGroup.innerHTML = "";
 		this.elements = snapshot.map((s) => {
-			if (s.kind === "freehand") return this.createFreehandElement(s.color, s.size, s.points, s.id);
+			if (s.kind === "freehand") return this.createFreehandElement(s.color, s.size, s.points, s.id, s.highlight);
 			if (s.kind === "text") return this.createTextElement(s.color, s.size, s.x, s.y, s.text, s.id);
 			return this.createShapeElement(s.kind, s.color, s.size, s.x0, s.y0, s.x1, s.y1, s.id);
 		});
@@ -1289,6 +1474,9 @@ export class DrawingView extends ItemView {
 		} else if (!mod && e.key.toLowerCase() === "p") {
 			this.setTool("pencil");
 			this.refreshToolbarState();
+		} else if (!mod && e.key.toLowerCase() === "m") {
+			this.setTool("highlighter");
+			this.refreshToolbarState();
 		} else if (!mod && e.key.toLowerCase() === "e") {
 			this.setTool("eraser");
 			this.refreshToolbarState();
@@ -1321,13 +1509,98 @@ export class DrawingView extends ItemView {
 		this.leaf.detach();
 	}
 
+	// --- Input diagnostics (debug HUD) ---
+
+	toggleDiagnostics(): void {
+		if (this.diag) {
+			cancelAnimationFrame(this.diag.rafId);
+			this.diag.el.remove();
+			this.diag = null;
+			return;
+		}
+		const el = this.canvasWrapEl.createDiv({ cls: "quick-sketch-diag" });
+		this.diag = {
+			el,
+			penDowns: 0,
+			lastDeliveryMs: 0,
+			maxDeliveryMs: 0,
+			lastLiftGapMs: 0,
+			lastDownToMoveMs: 0,
+			awaitingFirstMove: null,
+			maxDownHandlerMs: 0,
+			maxUpHandlerMs: 0,
+			longFrames: 0,
+			maxFrameMs: 0,
+			lastFrameAt: performance.now(),
+			rafId: 0,
+			touchesAccepted: 0,
+			touchesRejected: 0,
+			missedPointerUps: 0,
+			lastSaveMs: 0,
+			lastPenUpAt: 0,
+		};
+		const tick = (now: number) => {
+			const d = this.diag;
+			if (!d) return;
+			const frame = now - d.lastFrameAt;
+			d.lastFrameAt = now;
+			if (frame > 50) d.longFrames++;
+			d.maxFrameMs = Math.max(d.maxFrameMs, frame);
+			const f = (n: number) => n.toFixed(0).padStart(4);
+			d.el.setText(
+				[
+					`pen downs        ${d.penDowns}`,
+					`event delivery   last ${f(d.lastDeliveryMs)}ms  max ${f(d.maxDeliveryMs)}ms`,
+					`lift gap         ${f(d.lastLiftGapMs)}ms`,
+					`down→first move  ${f(d.lastDownToMoveMs)}ms`,
+					`handler max      down ${f(d.maxDownHandlerMs)}ms  up ${f(d.maxUpHandlerMs)}ms`,
+					`frames >50ms     ${d.longFrames}  worst ${f(d.maxFrameMs)}ms`,
+					`touch (palm)     accepted ${d.touchesAccepted}  rejected ${d.touchesRejected}`,
+					`missed pen-ups   ${d.missedPointerUps}`,
+					`last save        ${f(d.lastSaveMs)}ms`,
+					`elements ${this.elements.length}  zoom ${Math.round(this.zoom * 100)}%`,
+				].join("\n")
+			);
+			d.rafId = requestAnimationFrame(tick);
+		};
+		this.diag.rafId = requestAnimationFrame(tick);
+	}
+
 	private markDirtyAndScheduleSave(): void {
 		this.dirty = true;
 		this.updateStatus();
-		if (this.saveTimer) window.clearTimeout(this.saveTimer);
+		this.scheduleSave();
+	}
+
+	private scheduleSave(): void {
+		this.cancelScheduledSave();
 		this.saveTimer = window.setTimeout(() => {
-			this.flushSave();
+			this.saveTimer = null;
+			// Still mid-stroke/drag (e.g. a pointerup that never arrived)? Try later.
+			if (this.isInteracting()) {
+				this.scheduleSave();
+				return;
+			}
+			void this.flushSave();
 		}, SAVE_DEBOUNCE_MS);
+	}
+
+	private cancelScheduledSave(): void {
+		if (this.saveTimer) {
+			window.clearTimeout(this.saveTimer);
+			this.saveTimer = null;
+		}
+	}
+
+	private isInteracting(): boolean {
+		return !!(
+			this.activeStroke ||
+			this.activeShapeDraw ||
+			this.selectionDrag ||
+			this.selectionBox ||
+			this.erasing ||
+			this.panDrag
+		);
 	}
 
 	private async flushSave(): Promise<void> {
@@ -1339,31 +1612,11 @@ export class DrawingView extends ItemView {
 		const file = this.app.vault.getAbstractFileByPath(this.filePath);
 		if (!(file instanceof TFile)) return;
 		this.dirty = false;
+		// Embeds of this file in open notes are refreshed by the plugin's
+		// vault "modify" listener (see QuickSketchPlugin.refreshSvgEmbeds).
+		const t0 = performance.now();
 		await this.app.vault.modify(file, this.exportCroppedSvg());
-		this.refreshEmbedsForFile(file);
-	}
-
-	/** Obsidian's rendered <img> keeps pointing at the resource URL it first
-	 * loaded, so a plain vault.modify() leaves the old drawing on screen
-	 * anywhere it's embedded until the note is reopened. getResourcePath()
-	 * includes the file's mtime in the URL, so re-reading it after the save
-	 * and pushing it onto every matching embed's <img> forces a refetch.
-	 *
-	 * Matching is done on the img's *current* resource URL (stripped of its
-	 * mtime query) rather than by re-resolving the embed's link text --
-	 * resolving a link needs the source note's own path for context (relative
-	 * links resolve differently per-note), which isn't available here since
-	 * embeds across every open note are scanned at once. Comparing resource
-	 * URLs sidesteps that: the same file always maps to the same base URL
-	 * regardless of how any particular note linked to it. */
-	private refreshEmbedsForFile(file: TFile): void {
-		const resourcePath = this.app.vault.getResourcePath(file);
-		const base = resourcePath.split("?")[0];
-		document.querySelectorAll<HTMLImageElement>(".internal-embed img").forEach((img) => {
-			const src = img.getAttribute("src");
-			if (!src || src.split("?")[0] !== base) return;
-			img.setAttribute("src", resourcePath);
-		});
+		if (this.diag) this.diag.lastSaveMs = performance.now() - t0;
 	}
 
 	/** Serializes only the drawn elements, cropped to their bounding box --
@@ -1453,17 +1706,19 @@ export class DrawingView extends ItemView {
 		head.setAttribute("points", `${elem.x1},${elem.y1} ${p1x},${p1y} ${p2x},${p2y}`);
 	}
 
-	private createFreehandElement(color: string, size: number, points: Point[], id?: string): FreehandElement {
+	private createFreehandElement(
+		color: string,
+		size: number,
+		points: Point[],
+		id?: string,
+		highlight = false
+	): FreehandElement {
 		const pathEl = document.createElementNS(SVG_NS, "path") as SVGPathElement;
-		pathEl.setAttribute("stroke", color);
-		pathEl.setAttribute("stroke-width", String(size));
-		pathEl.setAttribute("fill", "none");
-		pathEl.setAttribute("stroke-linecap", "round");
-		pathEl.setAttribute("stroke-linejoin", "round");
+		this.styleFreehandPath(pathEl, color, size, highlight);
 		pathEl.setAttribute("d", buildSmoothPath(points));
 		pathEl.setAttribute("data-points", JSON.stringify(points));
-		this.elementsGroup.appendChild(pathEl);
-		return { id: id ?? uid(), kind: "freehand", el: pathEl, color, size, points };
+		this.insertPath(pathEl, highlight);
+		return { id: id ?? uid(), kind: "freehand", el: pathEl, color, size, points, highlight };
 	}
 
 	private createShapeElement(
@@ -1573,7 +1828,7 @@ export class DrawingView extends ItemView {
 		if (!root) return;
 
 		type RawElement =
-			| { kind: "freehand"; color: string; size: number; points: Point[] }
+			| { kind: "freehand"; color: string; size: number; points: Point[]; highlight: boolean }
 			| { kind: ShapeKind; color: string; size: number; x0: number; y0: number; x1: number; y1: number }
 			| { kind: "text"; color: string; size: number; x: number; y: number; text: string };
 
@@ -1599,7 +1854,8 @@ export class DrawingView extends ItemView {
 					}
 				}
 				if (points.length === 0) points = parseLegacyPathPoints(child.getAttribute("d") ?? "");
-				if (points.length > 0) raw.push({ kind: "freehand", color, size, points });
+				const highlight = child.getAttribute("data-highlight") === "true";
+				if (points.length > 0) raw.push({ kind: "freehand", color, size, points, highlight });
 			} else if (tag === "rect") {
 				const color = child.getAttribute("stroke") ?? DEFAULT_COLOR;
 				const size = parseFloat(child.getAttribute("stroke-width") ?? "") || DEFAULT_STROKE_PX;
@@ -1684,7 +1940,9 @@ export class DrawingView extends ItemView {
 				return this.createFreehandElement(
 					r.color,
 					r.size,
-					r.points.map((p) => ({ x: p.x + dx, y: p.y + dy }))
+					r.points.map((p) => ({ x: p.x + dx, y: p.y + dy })),
+					undefined,
+					r.highlight
 				);
 			}
 			if (r.kind === "text") {

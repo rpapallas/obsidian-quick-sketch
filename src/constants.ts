@@ -12,6 +12,7 @@ export const MAX_ZOOM = 8;
 
 export type Tool =
 	| "pencil"
+	| "highlighter"
 	| "eraser"
 	| "select"
 	| "pan"
@@ -62,6 +63,16 @@ export const COLORS: string[] = [
 	"#9c36b5", // purple
 	"#795548", // brown
 ];
+
+// Highlighter strokes are drawn semi-transparent, underneath all other ink,
+// and this many times wider than the selected S/M/L pencil size.
+export const HIGHLIGHT_COLORS: string[] = [
+	"#ffe066", // light yellow
+	"#ff8787", // light red
+	"#74c0fc", // light blue
+];
+export const HIGHLIGHT_OPACITY = 0.5;
+export const HIGHLIGHT_SIZE_MULTIPLIER = 4;
 
 export const DEFAULT_STROKE_PX = STROKE_SIZES[1].px;
 export const DEFAULT_COLOR = COLORS[0];

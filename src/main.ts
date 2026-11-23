@@ -1,4 +1,4 @@
-import { MarkdownPostProcessorContext, Notice, Plugin, TFile, moment, setIcon } from "obsidian";
+import { Notice, Plugin, TFile, moment, setIcon } from "obsidian";
 import { DrawingView } from "./DrawingView";
 import { EMPTY_SVG, VIEW_TYPE_DRAWING } from "./constants";
 import { registerIcons } from "./icons";
@@ -14,6 +14,14 @@ const DEFAULT_SETTINGS: QuickSketchSettings = {
 
 export default class QuickSketchPlugin extends Plugin {
 	settings: QuickSketchSettings = { ...DEFAULT_SETTINGS };
+
+	/** Latest saved content (as a data: URL) of every SVG modified this
+	 * session, keyed by vault path. Re-applied to embeds whenever they are
+	 * (re)built -- on iPad the note is usually hidden or torn down while the
+	 * drawing is edited, so the one-shot refresh in refreshSvgEmbeds finds
+	 * nothing, and the rebuilt embed then loads the stale image WKWebView
+	 * cached for the file's resource URL. */
+	private freshSvgs = new Map<string, string>();
 
 	async onload(): Promise<void> {
 		registerIcons();
@@ -33,9 +41,48 @@ export default class QuickSketchPlugin extends Plugin {
 			},
 		});
 
-		this.registerMarkdownPostProcessor((el, ctx) => {
-			this.decorateSvgEmbeds(el, ctx);
+		this.addCommand({
+			id: "toggle-input-diagnostics",
+			name: "Toggle input diagnostics",
+			checkCallback: (checking) => {
+				const view = this.app.workspace.getActiveViewOfType(DrawingView);
+				if (!view) return false;
+				if (!checking) view.toggleDiagnostics();
+				return true;
+			},
 		});
+
+		// Edit buttons on embedded drawings: watched for continuously rather
+		// than added from a markdown post processor -- post processors don't
+		// run for Live Preview embeds, and embeds can be (re)built well after
+		// the note renders (slow iCloud loads on iPad, CodeMirror recreating
+		// widgets on scroll), which would wipe a one-shot button.
+		this.app.workspace.onLayoutReady(() => {
+			this.observeForEmbeds(document);
+			this.scheduleEmbedScan();
+		});
+		this.registerEvent(this.app.workspace.on("window-open", (win) => this.observeForEmbeds(win.doc)));
+		this.registerEvent(this.app.workspace.on("layout-change", () => this.scheduleEmbedScan()));
+		this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.scheduleEmbedScan()));
+
+		// Keep embedded drawings in open notes in sync whenever the SVG changes
+		// (our own saves from the drawing view, or external edits).
+		this.registerEvent(
+			this.app.vault.on("modify", (file) => {
+				if (file instanceof TFile && file.extension.toLowerCase() === "svg") {
+					void this.refreshSvgEmbeds(file);
+				}
+			})
+		);
+		this.registerEvent(this.app.vault.on("delete", (file) => this.freshSvgs.delete(file.path)));
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				const cached = this.freshSvgs.get(oldPath);
+				if (cached === undefined) return;
+				this.freshSvgs.delete(oldPath);
+				this.freshSvgs.set(file.path, cached);
+			})
+		);
 	}
 
 	onunload(): void {
@@ -91,43 +138,117 @@ export default class QuickSketchPlugin extends Plugin {
 	}
 
 	/**
-	 * Obsidian loads embed content (fetching the image, wrapping it, etc.)
-	 * asynchronously *after* markdown post processors run, and can rebuild the
-	 * embed's DOM while doing so -- so a one-shot scan can miss the embed, or
-	 * a button we already added can get wiped out by that later rebuild. A
-	 * MutationObserver rescans and re-adds the button until things settle.
+	 * Obsidian's rendered <img> keeps the image it first loaded, so after the
+	 * SVG is modified the old drawing stays on screen until the note is
+	 * reopened. Swapping in a new resource URL isn't reliable (the mtime in
+	 * the URL may not have changed yet, and the app:// resource can be served
+	 * from cache), so instead we read the saved SVG and put it straight into
+	 * each matching <img> as a data: URL -- guaranteed to show the new content.
+	 *
+	 * Embeds are matched two ways: by resolving the embed's link text against
+	 * the note it lives in, and (as a fallback) by comparing resource URLs with
+	 * the query string stripped. Obsidian may rebuild embed DOM shortly after
+	 * a modify event, so we refresh again after a short delay.
 	 */
-	private decorateSvgEmbeds(el: HTMLElement, ctx: MarkdownPostProcessorContext): void {
-		const scan = () => {
-			const candidates = new Set<HTMLElement>();
-			if (el.matches?.(".internal-embed")) candidates.add(el);
-			el.querySelectorAll<HTMLElement>(".internal-embed").forEach((e) => candidates.add(e));
-
-			candidates.forEach((embedEl) => {
-				const linkPath = this.getSvgLinkPath(embedEl);
-				if (linkPath) this.attachEditButton(embedEl, linkPath, ctx.sourcePath);
-			});
+	async refreshSvgEmbeds(file: TFile): Promise<void> {
+		const content = await this.app.vault.read(file);
+		const dataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(content)}`;
+		this.freshSvgs.set(file.path, dataUrl);
+		const apply = () => {
+			const n = this.applySvgToEmbeds(file, dataUrl);
+			console.debug(`[quick-sketch] refreshed ${n} embed(s) of ${file.path}`);
 		};
+		apply();
+		window.setTimeout(apply, 300);
+		window.setTimeout(apply, 1000);
+	}
 
-		scan();
-		if (!el.matches?.(".internal-embed") && !el.querySelector(".internal-embed")) return;
+	private applySvgToEmbeds(file: TFile, dataUrl: string): number {
+		const base = this.app.vault.getResourcePath(file).split("?")[0];
+		const targets = new Set<HTMLImageElement>();
 
-		let idleTimer: number;
-		const observer = new MutationObserver(() => {
-			scan();
-			window.clearTimeout(idleTimer);
-			idleTimer = window.setTimeout(() => observer.disconnect(), 2000);
+		this.app.workspace.iterateAllLeaves((leaf) => {
+			const container = leaf.view.containerEl;
+			const sourcePath = (leaf.view as { file?: TFile | null }).file?.path ?? "";
+
+			container.querySelectorAll<HTMLElement>(".internal-embed").forEach((embed) => {
+				const link = embed.getAttribute("src");
+				if (!link) return;
+				const linkpath = link.split("#")[0].split("|")[0];
+				const dest = this.app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath);
+				if (dest?.path !== file.path) return;
+				embed.querySelectorAll("img").forEach((img) => targets.add(img));
+			});
+
+			container.querySelectorAll<HTMLImageElement>("img").forEach((img) => {
+				const src = img.getAttribute("src");
+				if (src && src.split("?")[0] === base) targets.add(img);
+			});
 		});
-		observer.observe(el, {
+
+		targets.forEach((img) => {
+			if (img.getAttribute("src") !== dataUrl) img.setAttribute("src", dataUrl);
+		});
+		return targets.size;
+	}
+
+	private embedScanQueued = false;
+
+	private observeForEmbeds(doc: Document): void {
+		const observer = new MutationObserver((records) => {
+			// Ignore the drawing view's own churn (a new <path> per stroke)
+			// so scans never compete with ink while writing.
+			const relevant = records.some((r) => {
+				const el = r.target instanceof Element ? r.target : r.target.parentElement;
+				return !el?.closest(`[data-type="${VIEW_TYPE_DRAWING}"]`);
+			});
+			if (relevant) this.scheduleEmbedScan();
+		});
+		observer.observe(doc.body, {
 			childList: true,
 			subtree: true,
 			attributes: true,
-			attributeFilter: ["src"],
+			attributeFilter: ["src", "class"],
 		});
-		idleTimer = window.setTimeout(() => observer.disconnect(), 2000);
-		this.register(() => {
-			window.clearTimeout(idleTimer);
-			observer.disconnect();
+		this.register(() => observer.disconnect());
+	}
+
+	/** Coalesces bursts of DOM mutations into one scan per animation frame. */
+	private scheduleEmbedScan(): void {
+		if (this.embedScanQueued) return;
+		this.embedScanQueued = true;
+		requestAnimationFrame(() => {
+			this.embedScanQueued = false;
+			this.scanEmbeds();
+		});
+	}
+
+	/** Scans every markdown leaf (so popout windows are included) and makes
+	 * sure each SVG embed has its edit button. Links are resolved relative to
+	 * the note the embed lives in. */
+	private scanEmbeds(): void {
+		this.app.workspace.iterateAllLeaves((leaf) => {
+			if (leaf.view.getViewType() !== "markdown") return;
+			const sourcePath = (leaf.view as { file?: TFile | null }).file?.path ?? "";
+			leaf.view.containerEl.querySelectorAll<HTMLElement>(".internal-embed").forEach((embedEl) => {
+				const linkPath = this.getSvgLinkPath(embedEl);
+				if (!linkPath) return;
+				this.attachEditButton(embedEl, linkPath, sourcePath);
+				this.applyFreshSvg(embedEl, linkPath, sourcePath);
+			});
+		});
+	}
+
+	/** Swaps a (re)built embed's <img> to the content we last saw saved,
+	 * if this session has modified that file. The equality guard keeps our
+	 * own src mutation from retriggering the observer forever. */
+	private applyFreshSvg(embedEl: HTMLElement, linkPath: string, sourcePath: string): void {
+		if (this.freshSvgs.size === 0) return;
+		const dest = this.app.metadataCache.getFirstLinkpathDest(linkPath.split("#")[0].split("|")[0], sourcePath);
+		const dataUrl = dest ? this.freshSvgs.get(dest.path) : undefined;
+		if (!dataUrl) return;
+		embedEl.querySelectorAll("img").forEach((img) => {
+			if (img.getAttribute("src") !== dataUrl) img.setAttribute("src", dataUrl);
 		});
 	}
 
@@ -156,7 +277,9 @@ export default class QuickSketchPlugin extends Plugin {
 	private attachEditButton(embedEl: HTMLElement, linkPath: string, sourcePath: string): void {
 		const img = embedEl.querySelector("img");
 		const anchor = (img?.parentElement as HTMLElement | null) ?? embedEl;
-		anchor.addClass("quick-sketch-embed");
+		// Guarded: classList.add() of a present class still emits a mutation
+		// record, which would retrigger the observer every frame.
+		if (!anchor.hasClass("quick-sketch-embed")) anchor.addClass("quick-sketch-embed");
 
 		let btn = embedEl.querySelector<HTMLButtonElement>(".quick-sketch-edit-btn");
 		if (btn) {
@@ -167,6 +290,16 @@ export default class QuickSketchPlugin extends Plugin {
 		btn = anchor.createEl("button", { cls: "quick-sketch-edit-btn" });
 		setIcon(btn, "pencil");
 		btn.setAttribute("aria-label", "Edit drawing");
+		// In Live Preview a press on the embed lets CodeMirror move the cursor
+		// into it (swapping the widget for its source text) before a click can
+		// fire -- especially on touch. Swallow the press so the tap lands.
+		const swallow = (evt: Event) => {
+			evt.preventDefault();
+			evt.stopPropagation();
+		};
+		btn.addEventListener("pointerdown", swallow);
+		btn.addEventListener("mousedown", swallow);
+		btn.addEventListener("touchstart", (evt) => evt.stopPropagation(), { passive: true });
 		btn.onclick = (evt) => {
 			evt.preventDefault();
 			evt.stopPropagation();
