@@ -1,0 +1,168 @@
+import { App, PluginSettingTab, Setting } from "obsidian";
+import { COLORS, DEFAULT_COLOR, DEFAULT_STROKE_PX, STROKE_SIZES, Tool } from "./constants";
+import type QuickSketchPlugin from "./main";
+
+export interface QuickSketchSettings {
+	/** Hex colors the user has added to the palette via the picker. */
+	customColors: string[];
+	/** Where new drawings are created: Obsidian's attachment location (as
+	 * configured in Files & links), or a fixed folder. */
+	location: "attachments" | "folder";
+	folder: string;
+	/** moment.js format for new drawings' file names. */
+	fileNameFormat: string;
+	defaultTool: Tool;
+	defaultColor: string;
+	defaultSize: number;
+	/** Vary the pen's stroke width with Apple Pencil / stylus pressure. */
+	pressure: boolean;
+	pngScale: number;
+	pngBackground: "white" | "transparent";
+}
+
+export const DEFAULT_SETTINGS: QuickSketchSettings = {
+	customColors: [],
+	location: "attachments",
+	folder: "Drawings",
+	fileNameFormat: "[Drawing] YYYY-MM-DD HH.mm.ss",
+	defaultTool: "pencil",
+	defaultColor: DEFAULT_COLOR,
+	defaultSize: DEFAULT_STROKE_PX,
+	pressure: true,
+	pngScale: 2,
+	pngBackground: "white",
+};
+
+const TOOL_NAMES: Partial<Record<Tool, string>> = {
+	pencil: "Pen",
+	highlighter: "Highlighter",
+	select: "Select",
+	lasso: "Lasso",
+	rectangle: "Rectangle",
+	ellipse: "Ellipse",
+	diamond: "Diamond",
+	line: "Line",
+	arrow: "Arrow",
+	text: "Text",
+};
+
+export class QuickSketchSettingTab extends PluginSettingTab {
+	constructor(app: App, private readonly plugin: QuickSketchPlugin) {
+		super(app, plugin);
+	}
+
+	display(): void {
+		const { containerEl } = this;
+		containerEl.empty();
+		const s = this.plugin.settings;
+		const save = () => void this.plugin.saveSettings();
+
+		new Setting(containerEl).setName("New drawings").setHeading();
+
+		new Setting(containerEl)
+			.setName("Location")
+			.setDesc("Where new drawing files are created.")
+			.addDropdown((d) =>
+				d
+					.addOption("attachments", "Same as attachments (Files & links setting)")
+					.addOption("folder", "A specific folder")
+					.setValue(s.location)
+					.onChange((v) => {
+						s.location = v as QuickSketchSettings["location"];
+						save();
+						this.display();
+					})
+			);
+
+		if (s.location === "folder") {
+			new Setting(containerEl)
+				.setName("Folder")
+				.setDesc("Created if it doesn't exist.")
+				.addText((t) =>
+					t
+						.setPlaceholder("Drawings")
+						.setValue(s.folder)
+						.onChange((v) => {
+							s.folder = v.trim();
+							save();
+						})
+				);
+		}
+
+		new Setting(containerEl)
+			.setName("File name")
+			.setDesc("A moment.js date format. Put literal text in [brackets].")
+			.addText((t) =>
+				t
+					.setPlaceholder(DEFAULT_SETTINGS.fileNameFormat)
+					.setValue(s.fileNameFormat)
+					.onChange((v) => {
+						s.fileNameFormat = v.trim() || DEFAULT_SETTINGS.fileNameFormat;
+						save();
+					})
+			);
+
+		new Setting(containerEl).setName("Defaults").setHeading();
+
+		new Setting(containerEl).setName("Tool").setDesc("The tool selected when a drawing opens.").addDropdown((d) => {
+			for (const [tool, name] of Object.entries(TOOL_NAMES)) d.addOption(tool, name as string);
+			d.setValue(s.defaultTool).onChange((v) => {
+				s.defaultTool = v as Tool;
+				save();
+			});
+		});
+
+		new Setting(containerEl).setName("Color").addDropdown((d) => {
+			const names = ["Black", "Gray", "Red", "Orange", "Green", "Blue", "Purple", "Brown"];
+			COLORS.forEach((c, i) => d.addOption(c, names[i] ?? c));
+			for (const c of s.customColors) d.addOption(c, c);
+			d.setValue(s.defaultColor).onChange((v) => {
+				s.defaultColor = v;
+				save();
+			});
+		});
+
+		new Setting(containerEl).setName("Stroke size").addDropdown((d) => {
+			for (const size of STROKE_SIZES) d.addOption(String(size.px), size.label);
+			d.setValue(String(s.defaultSize)).onChange((v) => {
+				s.defaultSize = Number(v);
+				save();
+			});
+		});
+
+		new Setting(containerEl)
+			.setName("Pressure sensitivity")
+			.setDesc("Vary the pen's line width with Apple Pencil or stylus pressure.")
+			.addToggle((t) =>
+				t.setValue(s.pressure).onChange((v) => {
+					s.pressure = v;
+					save();
+				})
+			);
+
+		new Setting(containerEl).setName("PNG export").setHeading();
+
+		new Setting(containerEl).setName("Resolution").addDropdown((d) =>
+			d
+				.addOption("1", "1x")
+				.addOption("2", "2x")
+				.addOption("3", "3x")
+				.setValue(String(s.pngScale))
+				.onChange((v) => {
+					s.pngScale = Number(v);
+					save();
+				})
+		);
+
+		new Setting(containerEl).setName("Background").addDropdown((d) =>
+			d
+				.addOption("white", "White")
+				.addOption("transparent", "Transparent")
+				.setValue(s.pngBackground)
+				.onChange((v) => {
+					s.pngBackground = v as QuickSketchSettings["pngBackground"];
+					save();
+				})
+		);
+	}
+}

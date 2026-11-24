@@ -1,29 +1,127 @@
 .quick-sketch-view {
-	display: flex;
-	flex-direction: column;
+	position: relative;
 	height: 100%;
-	padding: var(--size-4-2);
-	gap: var(--size-4-2);
+	padding: 0 !important;
+	overflow: hidden;
 }
 
-.quick-sketch-toolbar {
+/* --- Floating controls ------------------------------------------------ */
+
+.qs-island {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	padding: 4px;
+	border-radius: 12px;
+	background-color: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+	pointer-events: auto;
+}
+
+/* Tools centered at the top, history/menu/Done on the right. The bar
+   itself lets presses through to the canvas between the islands. */
+.qs-topbar {
+	position: absolute;
+	top: 10px;
+	left: 10px;
+	right: 10px;
+	z-index: 30;
+	display: flex;
+	align-items: flex-start;
+	gap: 8px;
+	pointer-events: none;
+}
+
+.qs-topbar-spacer,
+.qs-topbar-right {
+	flex: 1 1 0;
+	min-width: 0;
+	display: flex;
+}
+
+.qs-topbar-right {
+	justify-content: flex-end;
+}
+
+.qs-tools {
+	flex: 0 0 auto;
+}
+
+/* Narrow panes: tools on the left, actions wrap below if needed. */
+@media (max-width: 640px) {
+	.qs-topbar {
+		flex-wrap: wrap;
+	}
+	.qs-topbar-spacer {
+		display: none;
+	}
+}
+
+.qs-sep {
+	width: 1px;
+	height: 20px;
+	margin: 0 4px;
+	background-color: var(--background-modifier-border);
+}
+
+.qs-done {
+	margin-left: 6px;
+	height: 32px;
+	border-radius: 8px;
+}
+
+.qs-style-panel {
+	position: absolute;
+	top: 64px;
+	left: 10px;
+	z-index: 30;
+	flex-direction: column;
+	align-items: stretch;
+	gap: 10px;
+	padding: 10px;
+	width: 176px;
+	max-height: calc(100% - 130px);
+	overflow-y: auto;
+}
+
+.qs-section-title {
+	margin-bottom: 4px;
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.02em;
+	color: var(--text-muted);
+}
+
+.qs-section-body {
 	display: flex;
 	flex-wrap: wrap;
-	align-items: center;
-	gap: var(--size-4-3);
+	gap: 4px;
 }
 
-.quick-sketch-group {
-	display: flex;
-	align-items: center;
-	gap: var(--size-4-1);
+.qs-section-body.qs-swatches {
+	display: grid;
+	grid-template-columns: repeat(5, 26px);
+	gap: 6px;
 }
 
-.quick-sketch-sep {
-	width: 1px;
-	align-self: stretch;
-	min-height: 20px;
-	background-color: var(--background-modifier-border);
+.qs-zoom {
+	position: absolute;
+	left: 10px;
+	bottom: 10px;
+	z-index: 30;
+}
+
+.qs-zoom-label {
+	min-width: 52px;
+	height: 32px;
+	padding: 0 6px !important;
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+	background: transparent !important;
+	box-shadow: none !important;
+	border-radius: 8px;
+	cursor: pointer;
 }
 
 .quick-sketch-btn {
@@ -31,20 +129,41 @@
 	align-items: center;
 	justify-content: center;
 	box-sizing: border-box !important;
-	width: 30px !important;
-	height: 30px !important;
-	min-width: 30px !important;
-	min-height: 30px !important;
+	width: 32px !important;
+	height: 32px !important;
+	min-width: 32px !important;
+	min-height: 32px !important;
 	/* !important: Obsidian's mobile button padding otherwise wins, and with
 	   border-box a box can't be narrower than its padding -- stretching it. */
 	padding: 0 !important;
-	border-radius: var(--radius-s);
+	border: none;
+	border-radius: 8px;
+	background: transparent;
+	box-shadow: none;
+	color: var(--text-normal);
 	cursor: pointer;
 }
 
+/* Scoped to the view (and the element type) to outrank Obsidian's own
+   button:not(.clickable-icon) background and shadow. */
+.quick-sketch-view button.quick-sketch-btn {
+	background-color: transparent;
+	box-shadow: none;
+	border: none;
+}
+
+.quick-sketch-view button.quick-sketch-btn:hover {
+	background-color: var(--background-modifier-hover);
+}
+
+.quick-sketch-view button.quick-sketch-btn.is-active {
+	background-color: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
 .quick-sketch-btn svg {
-	width: 16px;
-	height: 16px;
+	width: 18px;
+	height: 18px;
 	flex: 0 0 auto;
 }
 
@@ -53,29 +172,21 @@
 	color: var(--text-on-accent);
 }
 
-.quick-sketch-size-btn {
-	/* Same !important guard as .quick-sketch-btn/.quick-sketch-swatch below --
-	   without it, Obsidian's mobile touch-target base styles (min-height with
-	   no matching min-width) stretch this into an oval/pill on iPad instead
-	   of a small square button matching the rest of the toolbar. */
-	display: inline-flex;
-	align-items: center;
-	justify-content: center;
-	box-sizing: border-box !important;
-	width: 30px !important;
-	height: 30px !important;
-	min-width: 30px !important;
-	min-height: 30px !important;
-	/* !important: Obsidian's mobile button padding otherwise wins, and with
-	   border-box a box can't be narrower than its padding -- stretching it. */
-	padding: 0 !important;
-	border-radius: var(--radius-s);
-	cursor: pointer;
+/* A grouped tool (select/lasso, shapes): small corner mark hinting that
+   pressing it again opens the others. */
+.qs-group-btn {
+	position: relative;
 }
 
-.quick-sketch-size-btn.is-active {
-	background-color: var(--interactive-accent);
-	color: var(--text-on-accent);
+.qs-group-btn::after {
+	content: "";
+	position: absolute;
+	right: 3px;
+	bottom: 3px;
+	border-style: solid;
+	border-width: 0 0 5px 5px;
+	border-color: transparent transparent currentColor transparent;
+	opacity: 0.55;
 }
 
 .quick-sketch-swatch {
@@ -88,12 +199,12 @@
 	display: inline-block;
 	flex: 0 0 auto;
 	box-sizing: border-box !important;
-	width: 24px !important;
-	height: 24px !important;
-	min-width: 24px !important;
-	min-height: 24px !important;
-	max-width: 24px !important;
-	max-height: 24px !important;
+	width: 26px !important;
+	height: 26px !important;
+	min-width: 26px !important;
+	min-height: 26px !important;
+	max-width: 26px !important;
+	max-height: 26px !important;
 	margin: 0;
 	padding: 0 !important;
 	border: none !important;
@@ -120,7 +231,8 @@
 }
 
 .quick-sketch-swatch.is-active::before {
-	border-color: var(--text-normal);
+	border-color: var(--background-primary);
+	box-shadow: 0 0 0 2px var(--interactive-accent);
 }
 
 .quick-sketch-swatch-add {
@@ -146,14 +258,10 @@
 	margin: 0;
 }
 
-.quick-sketch-done {
-	margin-left: auto;
-}
-
 .quick-sketch-canvas-wrap {
-	flex: 1;
+	position: absolute;
+	inset: 0;
 	overflow: hidden;
-	position: relative;
 	/* Stop WebKit/iPadOS from treating a pencil touch-and-hold as the start of
 	   a text-selection/long-press gesture -- that recognizer competing with
 	   our own pointer handling is what shows up as a delay before a quick
@@ -191,13 +299,18 @@
 	cursor: default;
 }
 
+.quick-sketch-canvas-wrap.tool-lasso .quick-sketch-canvas {
+	cursor: crosshair;
+}
+
 .quick-sketch-canvas-wrap.tool-pan .quick-sketch-canvas {
 	cursor: grab;
 }
 
 .quick-sketch-canvas-wrap.tool-rectangle .quick-sketch-canvas,
 .quick-sketch-canvas-wrap.tool-ellipse .quick-sketch-canvas,
-.quick-sketch-canvas-wrap.tool-triangle .quick-sketch-canvas,
+.quick-sketch-canvas-wrap.tool-diamond .quick-sketch-canvas,
+.quick-sketch-canvas-wrap.tool-line .quick-sketch-canvas,
 .quick-sketch-canvas-wrap.tool-arrow .quick-sketch-canvas {
 	cursor: crosshair;
 }
@@ -228,6 +341,17 @@
 	outline: none;
 }
 
+/* Label editor for a shape: centered on the shape, or sitting above an
+ * arrow's midpoint. */
+.quick-sketch-text-input.quick-sketch-label-input {
+	transform: translate(-50%, -50%);
+	text-align: center;
+}
+
+.quick-sketch-text-input.quick-sketch-label-input.is-arrow {
+	transform: translate(-50%, -100%);
+}
+
 .quick-sketch-selection-rect {
 	fill: none;
 	stroke: var(--interactive-accent);
@@ -244,10 +368,27 @@
 	vector-effect: non-scaling-stroke;
 }
 
-.quick-sketch-status {
-	font-size: 11px;
-	color: var(--text-muted);
-	user-select: none;
+/* Bounding box of the whole selection, its resize handles, and the
+   outline of a shape an arrow end is about to attach to. */
+.qs-selection-box {
+	fill: none;
+	stroke: var(--interactive-accent);
+	stroke-width: 1;
+	vector-effect: non-scaling-stroke;
+}
+
+.qs-handle {
+	fill: #ffffff;
+	stroke: var(--interactive-accent);
+	stroke-width: 1.5;
+	vector-effect: non-scaling-stroke;
+}
+
+.qs-bind-highlight {
+	fill: color-mix(in srgb, var(--interactive-accent) 10%, transparent);
+	stroke: var(--interactive-accent);
+	stroke-width: 2;
+	vector-effect: non-scaling-stroke;
 }
 
 .quick-sketch-embed {
@@ -310,8 +451,8 @@
 
 .quick-sketch-diag {
 	position: absolute;
-	top: 8px;
-	left: 8px;
+	right: 10px;
+	bottom: 10px;
 	z-index: 10;
 	pointer-events: none;
 	white-space: pre;

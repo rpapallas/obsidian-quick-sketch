@@ -84,12 +84,64 @@ const LUCIDE_24: Record<string, string> = {
 	"quick-sketch-ellipse": `
 		<circle cx="12" cy="12" r="9" />
 	`,
-	"quick-sketch-triangle": `
-		<path d="M12 3 L21 20 L3 20 Z" />
+	"quick-sketch-diamond": `
+		<path d="M12 2.5 L21.5 12 L12 21.5 L2.5 12 Z" />
 	`,
 	"quick-sketch-arrow": `
 		<path d="M5 12h14" />
 		<path d="m12 5 7 7-7 7" />
+	`,
+	"quick-sketch-line": `
+		<path d="M5 19 19 5" />
+	`,
+	"quick-sketch-lasso": `
+		<path d="M7 22a5 5 0 0 1-2-4" />
+		<path d="M3.3 14A6.8 6.8 0 0 1 2 10c0-4.4 4.5-8 10-8s10 3.6 10 8-4.5 8-10 8a12 12 0 0 1-5-1" />
+		<path d="M5 18a2 2 0 1 0 0-4 2 2 0 0 0 0 4z" />
+	`,
+	"quick-sketch-pointer": `
+		<path d="M4.04 4.73a.5.5 0 0 1 .69-.69l15.5 6.06a.5.5 0 0 1-.04.95l-6.32 1.95a2 2 0 0 0-1.33 1.33l-1.95 6.32a.5.5 0 0 1-.95.04z" />
+	`,
+	"quick-sketch-shapes": `
+		<path d="M8.3 10a.7.7 0 0 1-.63-1.04l3.7-6.43a.7.7 0 0 1 1.23 0l3.7 6.43a.7.7 0 0 1-.63 1.04z" />
+		<rect x="3" y="14" width="7" height="7" rx="1" />
+		<circle cx="17.5" cy="17.5" r="3.5" />
+	`,
+	"quick-sketch-more": `
+		<circle cx="12" cy="12" r="1" />
+		<circle cx="19" cy="12" r="1" />
+		<circle cx="5" cy="12" r="1" />
+	`,
+	"quick-sketch-copy": `
+		<rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+		<path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+	`,
+	"quick-sketch-duplicate": `
+		<line x1="15" x2="15" y1="12" y2="18" />
+		<line x1="12" x2="18" y1="15" y2="15" />
+		<rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+		<path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+	`,
+	"quick-sketch-image": `
+		<rect width="18" height="18" x="3" y="3" rx="2" ry="2" />
+		<circle cx="9" cy="9" r="2" />
+		<path d="m21 15-3.09-3.09a2 2 0 0 0-2.82 0L6 21" />
+	`,
+	"quick-sketch-download": `
+		<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+		<polyline points="7 10 12 15 17 10" />
+		<line x1="12" x2="12" y1="15" y2="3" />
+	`,
+	"quick-sketch-minus": `
+		<path d="M5 12h14" />
+	`,
+	"quick-sketch-plus": `
+		<path d="M5 12h14" />
+		<path d="M12 5v14" />
+	`,
+	"quick-sketch-settings": `
+		<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+		<circle cx="12" cy="12" r="3" />
 	`,
 	"quick-sketch-text": `
 		<polyline points="4 7 4 4 20 4 20 7" />
@@ -126,7 +178,19 @@ export const ICON = {
 	clear: "quick-sketch-clear",
 	rectangle: "quick-sketch-rectangle",
 	ellipse: "quick-sketch-ellipse",
-	triangle: "quick-sketch-triangle",
+	diamond: "quick-sketch-diamond",
 	arrow: "quick-sketch-arrow",
 	text: "quick-sketch-text",
+	line: "quick-sketch-line",
+	lasso: "quick-sketch-lasso",
+	pointer: "quick-sketch-pointer",
+	shapes: "quick-sketch-shapes",
+	more: "quick-sketch-more",
+	copy: "quick-sketch-copy",
+	duplicate: "quick-sketch-duplicate",
+	image: "quick-sketch-image",
+	download: "quick-sketch-download",
+	minus: "quick-sketch-minus",
+	plus: "quick-sketch-plus",
+	settings: "quick-sketch-settings",
 } as const;

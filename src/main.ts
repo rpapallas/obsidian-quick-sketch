@@ -1,16 +1,10 @@
-import { Notice, Plugin, TFile, moment, setIcon } from "obsidian";
+import { Notice, Plugin, TFile, TFolder, moment, normalizePath, setIcon } from "obsidian";
 import { DrawingView } from "./DrawingView";
 import { EMPTY_SVG, VIEW_TYPE_DRAWING } from "./constants";
 import { registerIcons } from "./icons";
+import { DEFAULT_SETTINGS, QuickSketchSettingTab, QuickSketchSettings } from "./settings";
 
-export interface QuickSketchSettings {
-	/** Hex colors the user has added to the palette via the picker. */
-	customColors: string[];
-}
-
-const DEFAULT_SETTINGS: QuickSketchSettings = {
-	customColors: [],
-};
+export type { QuickSketchSettings };
 
 export default class QuickSketchPlugin extends Plugin {
 	settings: QuickSketchSettings = { ...DEFAULT_SETTINGS };
@@ -40,6 +34,22 @@ export default class QuickSketchPlugin extends Plugin {
 				void this.createNewDrawing();
 			},
 		});
+
+		const viewCommand = (id: string, name: string, run: (view: DrawingView) => void) =>
+			this.addCommand({
+				id,
+				name,
+				checkCallback: (checking) => {
+					const view = this.app.workspace.getActiveViewOfType(DrawingView);
+					if (!view) return false;
+					if (!checking) run(view);
+					return true;
+				},
+			});
+		viewCommand("copy-as-png", "Copy drawing as PNG", (v) => v.copyAsPng());
+		viewCommand("export-png", "Export drawing as PNG", (v) => void v.exportPng());
+
+		this.addSettingTab(new QuickSketchSettingTab(this.app, this));
 
 		this.addCommand({
 			id: "toggle-input-diagnostics",
@@ -94,6 +104,7 @@ export default class QuickSketchPlugin extends Plugin {
 	async loadSettings(): Promise<void> {
 		const loaded = (await this.loadData()) as Partial<QuickSketchSettings> | null;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded ?? {});
+		this.settings.customColors = [...(this.settings.customColors ?? [])];
 		if (!Array.isArray(this.settings.customColors)) this.settings.customColors = [];
 	}
 
@@ -109,11 +120,22 @@ export default class QuickSketchPlugin extends Plugin {
 		}
 		const { editor, file: activeFile } = active;
 
-		const baseName = `Drawing ${moment().format("YYYY-MM-DD HH.mm.ss")}`;
-		const path = await this.app.fileManager.getAvailablePathForAttachment(
-			`${baseName}.svg`,
-			activeFile.path
-		);
+		const format = this.settings.fileNameFormat || DEFAULT_SETTINGS.fileNameFormat;
+		// Strip characters that aren't allowed in file names.
+		const baseName = moment().format(format).replace(/[\\/:*?"<>|#^[\]]/g, "-").trim() || "Drawing";
+		let path: string;
+		if (this.settings.location === "folder" && this.settings.folder) {
+			const folder = normalizePath(this.settings.folder);
+			if (!(this.app.vault.getAbstractFileByPath(folder) instanceof TFolder)) {
+				await this.app.vault.createFolder(folder).catch(() => undefined);
+			}
+			path = normalizePath(`${folder}/${baseName}.svg`);
+			for (let i = 1; this.app.vault.getAbstractFileByPath(path); i++) {
+				path = normalizePath(`${folder}/${baseName} ${i}.svg`);
+			}
+		} else {
+			path = await this.app.fileManager.getAvailablePathForAttachment(`${baseName}.svg`, activeFile.path);
+		}
 		const file = await this.app.vault.create(path, EMPTY_SVG);
 
 		const rawLink = this.app.fileManager.generateMarkdownLink(file, activeFile.path);
