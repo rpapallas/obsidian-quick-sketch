@@ -86,8 +86,10 @@
    can be dragged by the grip at the top. */
 .qs-style-panel {
 	position: absolute;
-	top: 58px;
-	right: 10px;
+	top: var(--qs-dock-top, 58px);
+	left: var(--qs-dock-left, auto);
+	right: var(--qs-dock-right, 10px);
+	max-height: var(--qs-dock-max-height, none);
 	/* Always as wide as its column, wherever it's dragged -- near an edge an
 	   absolutely-positioned box would otherwise shrink to fit. */
 	width: max-content;
@@ -368,6 +370,8 @@
 	touch-action: none;
 	background-color: #ffffff;
 	transform-origin: 0 0;
+	/* Pan/zoom values are set in code (applyTransform). */
+	transform: translate(var(--qs-pan-x, 0px), var(--qs-pan-y, 0px)) scale(var(--qs-zoom, 1));
 }
 
 /* Off-screen SVG used to measure content while the view is hidden. */
@@ -490,6 +494,11 @@
 
 .quick-sketch-text-input {
 	position: absolute;
+	/* Place, size and color are set in code for the text being edited. */
+	left: var(--qs-text-x, 0px);
+	top: var(--qs-text-y, 0px);
+	font-size: var(--qs-text-size, inherit);
+	color: var(--qs-text-color, inherit);
 	z-index: 20;
 	min-width: 60px;
 	min-height: 1.4em;

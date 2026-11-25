@@ -1423,10 +1423,9 @@ export class DrawingView extends ItemView {
 			dock.addClass("is-dragging");
 			const move = (evt: PointerEvent) => {
 				if (evt.pointerId !== down.pointerId) return;
-				// Drop the placed `right`; while dragging, the stylesheet pins
-				// it to auto so the panel doesn't stretch.
-				dock.style.removeProperty("right");
-				dock.setCssProps({ left: `${evt.clientX - host.left - grabX}px`, top: `${evt.clientY - host.top - grabY}px` });
+				// While dragging, the stylesheet pins `right` to auto so the
+				// panel doesn't stretch.
+				dock.setCssProps({ "--qs-dock-left": `${evt.clientX - host.left - grabX}px`, "--qs-dock-top": `${evt.clientY - host.top - grabY}px` });
 			};
 			const drop = (evt: PointerEvent) => {
 				if (evt.pointerId !== down.pointerId) return;
@@ -1470,7 +1469,12 @@ export class DrawingView extends ItemView {
 		const side = pos?.side ?? "right";
 		const top = Math.max(margin, Math.min(pos?.y ?? 58, hostH - 120));
 		const x = Math.max(margin, Math.min(pos?.x ?? margin, hostW - dock.offsetWidth - margin));
-		dock.setCssProps({ top: `${top}px`, left: side === "left" ? `${x}px` : "auto", right: side === "right" ? `${x}px` : "auto", "max-height": `${Math.max(120, hostH - top - margin)}px` });
+		dock.setCssProps({
+			"--qs-dock-top": `${top}px`,
+			"--qs-dock-left": side === "left" ? `${x}px` : "auto",
+			"--qs-dock-right": side === "right" ? `${x}px` : "auto",
+			"--qs-dock-max-height": `${Math.max(120, hostH - top - margin)}px`,
+		});
 	}
 
 	onResize(): void {
@@ -2113,7 +2117,7 @@ export class DrawingView extends ItemView {
 
 		const ta = this.canvasWrapEl.createEl("textarea", { cls: "quick-sketch-text-input" });
 		ta.rows = 1;
-		ta.setCssProps({ left: `${wrapPt.x}px`, top: `${wrapPt.y}px`, "font-size": `${fontSize * this.zoom}px`, color: this.currentColor });
+		ta.setCssProps({ "--qs-text-x": `${wrapPt.x}px`, "--qs-text-y": `${wrapPt.y}px`, "--qs-text-size": `${fontSize * this.zoom}px`, "--qs-text-color": this.currentColor });
 
 		this.textEditor = ta;
 		this.textEditorCanvasPoint = canvasPt;
@@ -2131,7 +2135,7 @@ export class DrawingView extends ItemView {
 		if (elem.kind === "arrow") ta.addClass("is-arrow");
 		ta.rows = 1;
 		ta.value = elem.label ?? "";
-		ta.setCssProps({ left: `${anchor.x * this.zoom + this.panX}px`, top: `${anchor.y * this.zoom + this.panY}px`, "font-size": `${fontSize * this.zoom}px`, color: elem.fill === "solid" ? contrastColor(elem.color) : elem.color });
+		ta.setCssProps({ "--qs-text-x": `${anchor.x * this.zoom + this.panX}px`, "--qs-text-y": `${anchor.y * this.zoom + this.panY}px`, "--qs-text-size": `${fontSize * this.zoom}px`, "--qs-text-color": elem.fill === "solid" ? contrastColor(elem.color) : elem.color });
 		if (elem.kind !== "arrow") {
 			// Match the width the label will wrap to inside the shape.
 			ta.setCssProps({ width: `${Math.max(60, this.labelBox(elem).width * this.zoom)}px` });
@@ -2160,7 +2164,7 @@ export class DrawingView extends ItemView {
 		const ta = this.canvasWrapEl.createEl("textarea", { cls: "quick-sketch-text-input" });
 		ta.rows = 1;
 		ta.value = elem.text;
-		ta.setCssProps({ left: `${top.x * this.zoom + this.panX}px`, top: `${top.y * this.zoom + this.panY}px`, "font-size": `${elem.size * this.zoom}px`, color: elem.color });
+		ta.setCssProps({ "--qs-text-x": `${top.x * this.zoom + this.panX}px`, "--qs-text-y": `${top.y * this.zoom + this.panY}px`, "--qs-text-size": `${elem.size * this.zoom}px`, "--qs-text-color": elem.color });
 		// Hide the rendered text while editing so it doesn't show twice.
 		elem.el.setAttribute("visibility", "hidden");
 
@@ -3151,7 +3155,7 @@ export class DrawingView extends ItemView {
 	}
 
 	private applyTransform(): void {
-		this.svgEl.setCssProps({ "transform": `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})` });
+		this.svgEl.setCssProps({ "--qs-pan-x": `${this.panX}px`, "--qs-pan-y": `${this.panY}px`, "--qs-zoom": `${this.zoom}` });
 		// Handles keep a constant on-screen size, so they're redrawn on zoom.
 		if (this.selection.size > 0) this.renderSelectionOverlay();
 		this.showZoom();
