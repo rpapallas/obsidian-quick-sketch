@@ -48,6 +48,11 @@ export default class QuickSketchPlugin extends Plugin {
 			});
 		viewCommand("copy-as-png", "Copy drawing as PNG", (v) => v.copyAsPng());
 		viewCommand("export-png", "Export drawing as PNG", (v) => void v.exportPng());
+		viewCommand("export-svg", "Export drawing as SVG", (v) => void v.exportSvg());
+		viewCommand("export-pdf", "Export drawing as PDF", (v) => void v.exportPdf());
+		viewCommand("copy-as-svg", "Copy drawing as SVG", (v) => v.copyAsSvg());
+		viewCommand("toggle-presentation", "Toggle presentation mode", (v) => v.togglePresentation());
+		viewCommand("insert-image", "Insert image into drawing", (v) => v.pickImageFile());
 
 		this.addSettingTab(new QuickSketchSettingTab(this.app, this));
 

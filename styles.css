@@ -44,6 +44,16 @@
 	justify-content: flex-end;
 }
 
+.qs-topbar-center {
+	flex: 0 1 auto;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 8px;
+	pointer-events: none;
+}
+
 .qs-tools {
 	flex: 0 0 auto;
 }
@@ -71,18 +81,24 @@
 	border-radius: 8px;
 }
 
+/* Sits right under the tools: its sections side by side, wrapping onto
+   more rows only when the pane is too narrow. */
 .qs-style-panel {
-	position: absolute;
-	top: 64px;
-	left: 10px;
-	z-index: 30;
-	flex-direction: column;
-	align-items: stretch;
-	gap: 10px;
-	padding: 10px;
-	width: 176px;
-	max-height: calc(100% - 130px);
-	overflow-y: auto;
+	flex-direction: row;
+	flex-wrap: wrap;
+	justify-content: center;
+	align-items: flex-start;
+	gap: 8px 0;
+	padding: 8px 4px;
+	max-width: 100%;
+}
+
+.qs-section {
+	padding: 0 10px;
+}
+
+.qs-section + .qs-section {
+	border-left: 1px solid var(--background-modifier-border);
 }
 
 .qs-section-title {
@@ -99,10 +115,18 @@
 	gap: 4px;
 }
 
+/* All swatches in one row, so the panel stays short; in a narrow pane,
+   two rows instead. The column counts are set in code. */
 .qs-section-body.qs-swatches {
 	display: grid;
-	grid-template-columns: repeat(5, 26px);
+	grid-template-columns: repeat(var(--qs-swatch-cols, 5), 26px);
 	gap: 6px;
+}
+
+@media (max-width: 640px) {
+	.qs-section-body.qs-swatches {
+		grid-template-columns: repeat(var(--qs-swatch-cols-narrow, 5), 26px);
+	}
 }
 
 .qs-zoom {
@@ -172,21 +196,51 @@
 	color: var(--text-on-accent);
 }
 
-/* A grouped tool (select/lasso, shapes): small corner mark hinting that
-   pressing it again opens the others. */
-.qs-group-btn {
-	position: relative;
+/* A grouped tool (select/lasso, shapes): the tool plus a chevron button
+   listing its variants, joined into one pill. */
+.qs-split {
+	display: inline-flex;
+	align-items: center;
+	border-radius: 8px;
 }
 
-.qs-group-btn::after {
-	content: "";
-	position: absolute;
-	right: 3px;
-	bottom: 3px;
-	border-style: solid;
-	border-width: 0 0 5px 5px;
-	border-color: transparent transparent currentColor transparent;
-	opacity: 0.55;
+.qs-split.is-active {
+	background-color: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+.quick-sketch-view .qs-split.is-active button.quick-sketch-btn.is-active {
+	background-color: transparent;
+}
+
+.quick-sketch-view button.qs-split-more {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box !important;
+	width: 16px !important;
+	min-width: 16px !important;
+	height: 32px !important;
+	min-height: 32px !important;
+	margin-left: -2px;
+	padding: 0 !important;
+	border: none;
+	border-radius: 0 8px 8px 0;
+	background: transparent;
+	box-shadow: none;
+	color: inherit;
+	opacity: 0.7;
+	cursor: pointer;
+}
+
+.quick-sketch-view button.qs-split-more:hover {
+	opacity: 1;
+	background-color: var(--background-modifier-hover);
+}
+
+.qs-split-more svg {
+	width: 12px;
+	height: 12px;
 }
 
 .quick-sketch-swatch {
@@ -317,6 +371,78 @@
 
 .quick-sketch-canvas-wrap.tool-text .quick-sketch-canvas {
 	cursor: text;
+}
+
+/* The laser dot replaces the cursor. */
+.quick-sketch-canvas-wrap.tool-laser .quick-sketch-canvas {
+	cursor: none;
+}
+
+/* Background paper (see PAPER_SPACING / PAPER_COLOR in constants.ts). It
+   is a background of the canvas itself, so it pans and zooms with it. */
+.quick-sketch-canvas.qs-paper-dots {
+	background-image: radial-gradient(circle at 12px 12px, #d0d4da 1.3px, transparent 1.6px);
+	background-size: 24px 24px;
+}
+
+.quick-sketch-canvas.qs-paper-grid {
+	background-image: linear-gradient(to right, #d0d4da 1px, transparent 1px), linear-gradient(to bottom, #d0d4da 1px, transparent 1px);
+	background-size: 24px 24px;
+}
+
+.quick-sketch-canvas.qs-paper-lines {
+	background-image: linear-gradient(to bottom, #d0d4da 1px, transparent 1px);
+	background-size: 32px 32px;
+}
+
+/* Presentation mode: only the drawing (and a faint exit button). */
+.quick-sketch-view.qs-presenting .qs-topbar,
+.quick-sketch-view.qs-presenting .qs-style-panel,
+.quick-sketch-view.qs-presenting .qs-zoom {
+	display: none !important;
+}
+
+.quick-sketch-view:fullscreen {
+	background-color: var(--background-primary);
+}
+
+.qs-present-exit {
+	position: absolute;
+	right: 14px;
+	bottom: 14px;
+	z-index: 30;
+	width: 36px;
+	height: 36px;
+	padding: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: 50%;
+	opacity: 0.35;
+	transition: opacity 0.15s;
+}
+
+.qs-present-exit:hover {
+	opacity: 1;
+}
+
+/* Hidden but still "in the page", so iOS will open its picker. */
+.qs-image-input {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	opacity: 0;
+	pointer-events: none;
+}
+
+/* Screen-space overlay for the laser pointer, above the (transformed) svg. */
+.qs-laser-canvas {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	pointer-events: none;
+	z-index: 5;
 }
 
 .quick-sketch-overlay {

@@ -1,4 +1,4 @@
-import { ItemView, Menu, Notice, TFile, ViewStateResult, WorkspaceLeaf, normalizePath, setIcon } from "obsidian";
+import { ItemView, Menu, Notice, Platform, TFile, ViewStateResult, WorkspaceLeaf, normalizePath, setIcon } from "obsidian";
 import {
 	ArrowHeads,
 	BIND_DISTANCE_PX,
@@ -8,6 +8,7 @@ import {
 	DEFAULT_COLOR,
 	DEFAULT_STROKE_PX,
 	DEFAULT_TOOL,
+	DashStyle,
 	DOUBLE_TAP_MS,
 	EMPTY_EXPORT_HEIGHT,
 	EMPTY_EXPORT_WIDTH,
@@ -19,12 +20,26 @@ import {
 	HIGHLIGHT_COLORS,
 	HIGHLIGHT_OPACITY,
 	HIGHLIGHT_SIZE_MULTIPLIER,
+	IMAGE_MAX_PX,
+	IMAGE_VIEW_FRACTION,
+	LASER_COLORS,
+	LASER_HOLD_FADE_MS,
+	LASER_TRAIL_MS,
+	LASER_WIDTH_PX,
+	LaserTrail,
 	MAX_ZOOM,
 	LIGHT_FILL_OPACITY,
 	MIN_ZOOM,
 	NUDGE_BIG_PX,
 	NUDGE_PX,
+	PAPER_ALIGN,
+	PAPER_COLOR,
+	PAPER_SPACING,
 	PASTE_OFFSET,
+	Paper,
+	RECOGNIZE_HOLD_MS,
+	RECOGNIZE_HOLD_TOLERANCE_PX,
+	RECOGNIZE_MIN_SIZE_PX,
 	SELECT_HIT_RADIUS_PX,
 	SELECT_TOOLS,
 	SHAPE_TOOLS,
@@ -37,10 +52,12 @@ import {
 	SIMPLIFY_TOLERANCE,
 } from "./constants";
 import { ConfirmModal } from "./confirm";
-import { copyPngToClipboard, svgToPng } from "./export";
+import { canvasToPdf, copyPngToClipboard, svgToCanvas, svgToPng } from "./export";
 import { decodePressure, encodePressure, pressureOutline } from "./freehand";
 import { ICON } from "./icons";
 import type QuickSketchPlugin from "./main";
+import { recognizeShape } from "./recognize";
+import { saveExport } from "./save";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 // Autosave waits for a real pause: a save (serializing the SVG, writing the
@@ -87,7 +104,8 @@ interface Point {
 
 /** "triangle" is no longer drawable (the toolbar offers a diamond instead)
  * but is kept so triangles in older files still load and render. */
-type ShapeKind = "rectangle" | "ellipse" | "diamond" | "triangle" | "arrow";
+/** An "image" is a pasted/inserted picture, handled as a box like the shapes. */
+type ShapeKind = "rectangle" | "ellipse" | "diamond" | "triangle" | "arrow" | "image";
 type ElementKind = "freehand" | ShapeKind | "text";
 
 interface FreehandElement {
@@ -121,6 +139,10 @@ interface ShapeData {
 	/** Arrows only: ids of the elements the start/end is attached to. */
 	startBind?: string;
 	endBind?: string;
+	/** Closed shapes and arrows; missing means solid. */
+	dash?: DashStyle;
+	/** Images only: the picture, as a data: URL. */
+	href?: string;
 }
 
 interface ShapeElement {
@@ -137,6 +159,8 @@ interface ShapeElement {
 	heads?: ArrowHeads;
 	startBind?: string;
 	endBind?: string;
+	dash?: DashStyle;
+	href?: string;
 	/** Optional text centered inside the shape (or above an arrow's line). */
 	label?: string;
 	labelSize?: number; // font size
@@ -244,6 +268,42 @@ interface EndpointDrag {
 	snapshotTaken: boolean;
 }
 
+/** Which style panel sections apply to the current tool or selection. */
+interface StyleContext {
+	laser: boolean;
+	/** Color and size. */
+	stroke: boolean;
+	highlight: boolean;
+	fill: boolean;
+	heads: boolean;
+	dash: boolean;
+	actions: boolean;
+}
+
+/** A laser trail point, in wrapper (screen) coordinates. */
+interface LaserPoint {
+	x: number;
+	y: number;
+	t: number;
+}
+
+/** The laser pointer: a dot following the pointer (on hover too), and while
+ * pressed a trail that fades out behind it. Drawn on its own small screen-
+ * space <canvas>, never in the drawing -- nothing is saved or undoable, and
+ * the huge SVG never has to re-render. */
+interface LaserState {
+	canvas: HTMLCanvasElement;
+	ctx: CanvasRenderingContext2D;
+	/** Separate strokes; old points expire. `fadeFrom` is set when the whole
+	 * trail starts fading out (a "hold" trail once the next one begins). */
+	trails: { points: LaserPoint[]; fadeFrom: number | null }[];
+	/** Pointer currently drawing the newest trail, if pressed. */
+	pointerId: number | null;
+	/** Where the dot is drawn; null hides it (pointer left the canvas). */
+	dot: Point | null;
+	rafId: number | null;
+}
+
 interface Bounds {
 	minX: number;
 	minY: number;
@@ -307,6 +367,7 @@ const KEY_TOOLS: Record<string, Tool> = {
 	l: "line",
 	v: "select",
 	f: "lasso",
+	k: "laser",
 };
 
 /** Single-key shortcuts for the ink color. */
@@ -523,6 +584,14 @@ function pointInPolygon(x: number, y: number, poly: Point[]): boolean {
 	return inside;
 }
 
+/** "#rrggbb" -> "r, g, b" (for building rgba() strings), or null. */
+function hexToRgb(hex: string): string | null {
+	const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+	if (!m) return null;
+	const n = parseInt(m[1], 16);
+	return `${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}`;
+}
+
 /** Black or white, whichever reads better on `hex`. */
 function contrastColor(hex: string): string {
 	const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
@@ -570,7 +639,57 @@ function elementHit(elem: DrawnElement, x: number, y: number, radius: number): b
 }
 
 function isBindable(e: DrawnElement): e is ShapeElement | TextElement {
-	return e.kind === "text" || isClosedShape(e);
+	return e.kind === "text" || e.kind === "image" || isClosedShape(e);
+}
+
+/** stroke-dasharray for a dashed/dotted stroke of width `size`. */
+function dashArray(dash: DashStyle | undefined, size: number): string | null {
+	if (dash === "dashed") return `${fmt(Math.max(size * 3, 6))} ${fmt(Math.max(size * 2.5, 5))}`;
+	if (dash === "dotted") return `0 ${fmt(Math.max(size * 2, 4))}`;
+	return null;
+}
+
+/** Reads an image file into a data: URL, downscaled to IMAGE_MAX_PX on its
+ * longest side (it's stored inside the drawing). */
+async function loadImageFile(file: File): Promise<{ href: string; width: number; height: number }> {
+	const original = await new Promise<string>((resolve, reject) => {
+		const reader = new FileReader();
+		reader.onload = () => resolve(String(reader.result));
+		reader.onerror = () => reject(new Error("Couldn't read the image."));
+		reader.readAsDataURL(file);
+	});
+	const img = new Image();
+	await new Promise<void>((resolve, reject) => {
+		img.onload = () => resolve();
+		img.onerror = () => reject(new Error("That image format isn't supported."));
+		img.src = original;
+	});
+	const w = img.naturalWidth || 300;
+	const h = img.naturalHeight || 200;
+	const scale = Math.min(1, IMAGE_MAX_PX / Math.max(w, h));
+	if (scale === 1 || file.type === "image/svg+xml") return { href: original, width: w, height: h };
+	const canvas = document.createElement("canvas");
+	canvas.width = Math.round(w * scale);
+	canvas.height = Math.round(h * scale);
+	const ctx = canvas.getContext("2d");
+	if (!ctx) return { href: original, width: w, height: h };
+	ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+	// PNGs may be transparent; anything else (photos) is smaller as JPEG.
+	const href = file.type === "image/png" ? canvas.toDataURL("image/png") : canvas.toDataURL("image/jpeg", 0.85);
+	return { href, width: canvas.width, height: canvas.height };
+}
+
+/** The background paper as a <pattern> (for saving it into the file).
+ * Matches the CSS backgrounds used while editing. */
+function paperPattern(paper: Exclude<Paper, "none">): string {
+	const n = PAPER_SPACING[paper];
+	const inner =
+		paper === "dots"
+			? `<circle cx="${n / 2}" cy="${n / 2}" r="1.3" fill="${PAPER_COLOR}"/>`
+			: paper === "grid"
+				? `<rect width="${n}" height="1" fill="${PAPER_COLOR}"/><rect width="1" height="${n}" fill="${PAPER_COLOR}"/>`
+				: `<rect width="${n}" height="1" fill="${PAPER_COLOR}"/>`;
+	return `<pattern id="qs-paper" patternUnits="userSpaceOnUse" width="${n}" height="${n}">${inner}</pattern>`;
 }
 
 /** The element's outermost DOM node (a labeled shape's wrapping group). */
@@ -609,6 +728,15 @@ function lineIcon(width: number): string {
 function fillIcon(opacity: number): string {
 	return glyph(`<rect x="4" y="4" width="16" height="16" rx="3" stroke-width="2" fill="currentColor" fill-opacity="${opacity}"/>`);
 }
+function dashIcon(dash: DashStyle): string {
+	const pattern = dash === "dashed" ? ` stroke-dasharray="5 3.5"` : dash === "dotted" ? ` stroke-dasharray="0 4"` : "";
+	return glyph(`<line x1="4" y1="12" x2="20" y2="12" stroke-width="${dash === "dotted" ? 2.5 : 2}"${pattern}/>`);
+}
+function trailIcon(trail: LaserTrail): string {
+	if (trail === "hold") return glyph(`<path d="M3 15c3-7 6-7 9-3s6 4 9-3" stroke-width="2"/>`);
+	if (trail === "long") return glyph(`<path d="M3 12h5" stroke-width="2" opacity=".25"/><path d="M8 12h5" stroke-width="2" opacity=".55"/><path d="M13 12h7" stroke-width="2"/>`);
+	return glyph(`<path d="M9 12h4" stroke-width="2" opacity=".35"/><path d="M13 12h6" stroke-width="2"/>`);
+}
 function headsIcon(start: boolean, end: boolean): string {
 	let inner = `<line x1="4" y1="12" x2="20" y2="12" stroke-width="2"/>`;
 	if (end) inner += `<path d="M14 7l6 5-6 5" stroke-width="2"/>`;
@@ -640,6 +768,19 @@ export class DrawingView extends ItemView {
 	private currentHighlightSize = DEFAULT_STROKE_PX;
 	private currentFill: FillStyle = "none";
 	private currentArrowHeads: ArrowHeads = "end";
+	private currentDash: DashStyle = "solid";
+	/** Background paper of this drawing (saved in the file). */
+	private paper: Paper = "none";
+	/** Presentation mode: UI hidden, laser on; the tool to go back to. */
+	private presenting = false;
+	private toolBeforePresenting: Tool | null = null;
+	private presentExitEl: HTMLElement | null = null;
+	/** Shape recognition: fires when the pen rests at `anchor` long enough. */
+	private recognizeTimer: number | null = null;
+	private recognizeAnchor: Point | null = null;
+	/** Cmd/Ctrl+V pastes copied elements unless a paste event brings an image. */
+	private pasteFallbackTimer: number | null = null;
+	private imageInputEl: HTMLInputElement | null = null;
 	/** The variant each grouped toolbar button switches to. */
 	private lastShapeTool: Tool = "rectangle";
 	private lastSelectTool: Tool = "select";
@@ -676,6 +817,7 @@ export class DrawingView extends ItemView {
 	private lastNudgeAt = 0;
 
 	private panDrag: PanDrag | null = null;
+	private laser: LaserState | null = null;
 
 	private undoStack: SerializedElement[][] = [];
 	private redoStack: SerializedElement[][] = [];
@@ -698,6 +840,8 @@ export class DrawingView extends ItemView {
 
 	private onWindowKeyDown: (e: KeyboardEvent) => void = () => {};
 	private onWindowKeyUp: (e: KeyboardEvent) => void = () => {};
+	private onWindowPaste: (e: ClipboardEvent) => void = () => {};
+	private onFullscreenChange: () => void = () => {};
 
 	constructor(leaf: WorkspaceLeaf, plugin: QuickSketchPlugin) {
 		super(leaf);
@@ -733,8 +877,16 @@ export class DrawingView extends ItemView {
 				this.applyToolClass();
 			}
 		};
+		this.onWindowPaste = (e: ClipboardEvent) => this.handlePaste(e);
+		this.onFullscreenChange = () => {
+			if (!this.presenting) return;
+			if (document.fullscreenElement === this.contentEl) requestAnimationFrame(() => this.zoomToFit());
+			else this.exitPresentation();
+		};
 		window.addEventListener("keydown", this.onWindowKeyDown);
 		window.addEventListener("keyup", this.onWindowKeyUp);
+		window.addEventListener("paste", this.onWindowPaste);
+		document.addEventListener("fullscreenchange", this.onFullscreenChange);
 		if (this.filePath) {
 			await this.loadFromFile();
 		}
@@ -743,14 +895,21 @@ export class DrawingView extends ItemView {
 
 	async onClose(): Promise<void> {
 		if (this.diag) this.toggleDiagnostics();
+		if (this.presenting) this.exitPresentation();
+		this.clearLaser();
+		this.disarmRecognizer();
+		if (this.pasteFallbackTimer !== null) window.clearTimeout(this.pasteFallbackTimer);
 		window.removeEventListener("keydown", this.onWindowKeyDown);
 		window.removeEventListener("keyup", this.onWindowKeyUp);
+		window.removeEventListener("paste", this.onWindowPaste);
+		document.removeEventListener("fullscreenchange", this.onFullscreenChange);
 		this.cancelTextEditor();
 		if (this.canvasWrapEl) {
 			this.canvasWrapEl.removeEventListener("pointerdown", this.onPointerDown);
 			this.canvasWrapEl.removeEventListener("pointermove", this.onPointerMove);
 			this.canvasWrapEl.removeEventListener("pointerup", this.onPointerUp);
 			this.canvasWrapEl.removeEventListener("pointercancel", this.onPointerUp);
+			this.canvasWrapEl.removeEventListener("pointerleave", this.onPointerLeave);
 			this.canvasWrapEl.removeEventListener("wheel", this.onWheel);
 		}
 		await this.flushSave();
@@ -800,14 +959,17 @@ export class DrawingView extends ItemView {
 		// handlers.
 		const topbar = container.createDiv({ cls: "qs-topbar" });
 		topbar.createDiv({ cls: "qs-topbar-spacer" });
-		this.toolbarEl = topbar.createDiv({ cls: "qs-island qs-tools" });
+		// Tools, with the style panel for the current tool right below them.
+		const center = topbar.createDiv({ cls: "qs-topbar-center" });
+		this.toolbarEl = center.createDiv({ cls: "qs-island qs-tools" });
 		const right = topbar.createDiv({ cls: "qs-topbar-right" });
 		this.actionsEl = right.createDiv({ cls: "qs-island qs-actions" });
-		this.stylePanelEl = container.createDiv({ cls: "qs-island qs-style-panel" });
+		this.stylePanelEl = center.createDiv({ cls: "qs-island qs-style-panel" });
 		this.zoomEl = container.createDiv({ cls: "qs-island qs-zoom" });
 
 		this.buildToolbar();
 		this.applyToolClass();
+		this.applyPaper();
 
 		// Listeners live on the wrapper (not the svg) so panning/zooming still
 		// works when zoomed out far enough that empty wrapper space is showing
@@ -816,7 +978,31 @@ export class DrawingView extends ItemView {
 		canvasWrap.addEventListener("pointermove", this.onPointerMove);
 		canvasWrap.addEventListener("pointerup", this.onPointerUp);
 		canvasWrap.addEventListener("pointercancel", this.onPointerUp);
+		canvasWrap.addEventListener("pointerleave", this.onPointerLeave);
 		canvasWrap.addEventListener("wheel", this.onWheel, { passive: false });
+		canvasWrap.addEventListener("dragover", (evt) => {
+			if (evt.dataTransfer?.types.includes("Files")) {
+				evt.preventDefault();
+				evt.dataTransfer.dropEffect = "copy";
+			}
+		});
+		canvasWrap.addEventListener("drop", (evt) => {
+			const files = Array.from(evt.dataTransfer?.files ?? []).filter((f) => f.type.startsWith("image/"));
+			if (files.length === 0) return;
+			evt.preventDefault();
+			evt.stopPropagation();
+			void this.insertImageFiles(files, this.toCanvasPoint(evt));
+		});
+
+		// For "Insert image": a real (if invisible) file input in the DOM --
+		// iOS only opens the picker for inputs that are part of the page.
+		const input = container.createEl("input", { type: "file", cls: "qs-image-input", attr: { accept: "image/*", multiple: "" } });
+		input.addEventListener("change", () => {
+			const files = Array.from(input.files ?? []);
+			input.value = "";
+			if (files.length > 0) void this.insertImageFiles(files);
+		});
+		this.imageInputEl = input;
 
 		// iPadOS/WebKit runs its own gesture recognizers (double-tap zoom, the
 		// text-selection loupe, Scribble) on raw touch events, *independently*
@@ -852,6 +1038,7 @@ export class DrawingView extends ItemView {
 			() => this.lastSelectTool
 		);
 		this.btn(tb, "Pan (or hold Space / drag with two fingers)", ICON.hand, () => this.setTool("pan"), () => this.tool === "pan");
+		this.btn(tb, "Laser pointer (K)", ICON.laser, () => this.setTool("laser"), () => this.tool === "laser");
 		tb.createDiv({ cls: "qs-sep" });
 		this.btn(tb, "Pen (P)", ICON.pencil, () => this.setTool("pencil"), () => this.tool === "pencil");
 		this.btn(tb, "Highlighter (H)", ICON.highlighter, () => this.setTool("highlighter"), () => this.tool === "highlighter");
@@ -872,6 +1059,7 @@ export class DrawingView extends ItemView {
 
 		const actions = this.actionsEl;
 		actions.empty();
+		this.btn(actions, "Present (laser pointer, hidden toolbar)", ICON.present, () => this.togglePresentation());
 		this.btn(actions, "Undo (Cmd/Ctrl+Z)", ICON.undo, () => this.undo());
 		this.btn(actions, "Redo (Cmd/Ctrl+Shift+Z)", ICON.redo, () => this.redo());
 		const moreBtn = this.btn(actions, "More", ICON.more, () => this.openMoreMenu(moreBtn));
@@ -916,7 +1104,12 @@ export class DrawingView extends ItemView {
 	 * the last one used; pressing it while one of them is active opens a menu
 	 * of all of them. */
 	private groupButton(parent: HTMLElement, variants: { tool: Tool; name: string; key: string; icon: string }[], last: () => Tool): void {
-		const btn = parent.createEl("button", { cls: "quick-sketch-btn qs-group-btn" });
+		// A split button: the tool itself, plus a chevron that lists all the
+		// variants (pressing the tool again while it's active does too).
+		const wrap = parent.createDiv({ cls: "qs-split" });
+		const btn = wrap.createEl("button", { cls: "quick-sketch-btn qs-group-btn" });
+		const more = wrap.createEl("button", { cls: "qs-split-more" });
+		setIcon(more, ICON.chevronDown);
 		const isActive = () => variants.some((v) => v.tool === this.tool);
 		const sync = () => {
 			const v = variants.find((x) => x.tool === last()) ?? variants[0];
@@ -925,18 +1118,17 @@ export class DrawingView extends ItemView {
 				setIcon(btn, v.icon);
 				btn.dataset.icon = v.icon;
 			}
-			const label = `${v.name} (${v.key}) - press again for ${variants.length > 2 ? "more" : variants.filter((x) => x !== v).map((x) => x.name.toLowerCase()).join("")}`;
+			const label = `${v.name} (${v.key})`;
 			btn.setAttribute("aria-label", label);
 			btn.setAttribute("title", label);
+			const moreLabel = `More: ${variants.map((x) => x.name.toLowerCase()).join(", ")}`;
+			more.setAttribute("aria-label", moreLabel);
+			more.setAttribute("title", moreLabel);
+			wrap.toggleClass("is-active", isActive());
 		};
 		sync();
 		this.groupSyncs.push(sync);
-		btn.onclick = (evt) => {
-			evt.preventDefault();
-			if (!isActive()) {
-				this.setTool(last());
-				return;
-			}
+		const openMenu = () => {
 			const menu = new Menu();
 			for (const v of variants) {
 				menu.addItem((item) =>
@@ -947,16 +1139,48 @@ export class DrawingView extends ItemView {
 						.onClick(() => this.setTool(v.tool))
 				);
 			}
-			const r = btn.getBoundingClientRect();
+			const r = wrap.getBoundingClientRect();
 			menu.showAtPosition({ x: r.left, y: r.bottom + 6 });
+		};
+		btn.onclick = (evt) => {
+			evt.preventDefault();
+			if (isActive()) openMenu();
+			else this.setTool(last());
+		};
+		more.onclick = (evt) => {
+			evt.preventDefault();
+			openMenu();
 		};
 		this.activeChecks.set(btn, isActive);
 	}
 
+
 	private openMoreMenu(anchor: HTMLElement): void {
 		const menu = new Menu();
+		menu.addItem((i) => i.setTitle("Present").setIcon(ICON.present).onClick(() => this.togglePresentation()));
+		menu.addItem((i) => i.setTitle("Insert image…").setIcon(ICON.imagePlus).onClick(() => this.pickImageFile()));
+		menu.addSeparator();
 		menu.addItem((i) => i.setTitle("Copy as PNG").setIcon(ICON.image).onClick(() => this.copyAsPng()));
-		menu.addItem((i) => i.setTitle("Export PNG to vault").setIcon(ICON.download).onClick(() => void this.exportPng()));
+		menu.addItem((i) => i.setTitle("Copy as SVG").setIcon(ICON.copy).onClick(() => this.copyAsSvg()));
+		menu.addItem((i) => i.setTitle("Export PNG…").setIcon(ICON.download).onClick(() => void this.exportPng()));
+		menu.addItem((i) => i.setTitle("Export SVG…").setIcon(ICON.download).onClick(() => void this.exportSvg()));
+		menu.addItem((i) => i.setTitle("Export PDF…").setIcon(ICON.download).onClick(() => void this.exportPdf()));
+		menu.addSeparator();
+		const papers: [Paper, string][] = [
+			["none", "Plain paper"],
+			["dots", "Dotted paper"],
+			["grid", "Grid paper"],
+			["lines", "Lined paper"],
+		];
+		for (const [paper, name] of papers) {
+			menu.addItem((i) =>
+				i
+					.setTitle(name)
+					.setIcon(ICON.paper)
+					.setChecked(this.paper === paper)
+					.onClick(() => this.setPaper(paper))
+			);
+		}
 		menu.addSeparator();
 		menu.addItem((i) => i.setTitle("Select all (Cmd/Ctrl+A)").setIcon(ICON.pointer).onClick(() => this.selectAll()));
 		menu.addItem((i) => i.setTitle("Zoom to fit").setIcon(ICON.fit).onClick(() => this.zoomToFit()));
@@ -989,29 +1213,37 @@ export class DrawingView extends ItemView {
 		return SELECT_TOOLS.has(this.tool) && this.selectedIds.size > 0;
 	}
 
-	private styleContext(): { highlight: boolean; fill: boolean; heads: boolean; actions: boolean } | null {
+	private styleContext(): StyleContext | null {
+		const none = { laser: false, stroke: false, highlight: false, fill: false, heads: false, dash: false, actions: false };
 		if (SELECT_TOOLS.has(this.tool)) {
 			const sel = this.selectedElements();
 			if (sel.length === 0) return null;
+			const drawn = sel.filter((e) => e.kind !== "image");
 			return {
-				highlight: sel.every((e) => e.kind === "freehand" && e.highlight),
+				...none,
+				stroke: drawn.length > 0,
+				highlight: drawn.length > 0 && drawn.every((e) => e.kind === "freehand" && e.highlight),
 				fill: sel.some((e) => isClosedShape(e)),
 				heads: sel.some((e) => e.kind === "arrow"),
+				dash: sel.some((e) => e.kind === "arrow" || isClosedShape(e)),
 				actions: true,
 			};
 		}
 		if (this.tool === "pan" || this.tool === "eraser") return null;
+		if (this.tool === "laser") return { ...none, laser: true };
 		return {
+			...none,
+			stroke: true,
 			highlight: this.tool === "highlighter",
 			fill: CLOSED_SHAPE_TOOLS.has(this.tool),
 			heads: this.tool === "arrow",
-			actions: false,
+			dash: SHAPE_TOOLS.has(this.tool),
 		};
 	}
 
 	/** The element whose style the panel shows while editing a selection. */
 	private styleSample(): DrawnElement | undefined {
-		return this.editingSelection() ? this.selectedElements()[0] : undefined;
+		return this.editingSelection() ? this.selectedElements().find((e) => e.kind !== "image") : undefined;
 	}
 
 	private shownColor(): string {
@@ -1036,6 +1268,12 @@ export class DrawingView extends ItemView {
 		return this.currentFill;
 	}
 
+	private shownDash(): DashStyle {
+		const s = this.selectedElements().find((e) => e.kind === "arrow" || isClosedShape(e)) as ShapeElement | undefined;
+		if (this.editingSelection()) return s?.dash ?? "solid";
+		return this.currentDash;
+	}
+
 	private shownHeads(): ArrowHeads {
 		const s = this.selectedElements().find((e) => e.kind === "arrow") as ShapeElement | undefined;
 		if (this.editingSelection()) return s?.heads ?? "end";
@@ -1055,7 +1293,69 @@ export class DrawingView extends ItemView {
 			return sec.createDiv({ cls: "qs-section-body" });
 		};
 
-		// Colors.
+		if (ctx.laser) {
+			const settings = this.plugin.settings;
+			const colors = section("Laser color");
+			colors.addClass("qs-swatches");
+			colors.style.setProperty("--qs-swatch-cols", String(LASER_COLORS.length));
+			colors.style.setProperty("--qs-swatch-cols-narrow", String(LASER_COLORS.length));
+			for (const color of LASER_COLORS) {
+				const sw = colors.createEl("button", { cls: "quick-sketch-swatch", attr: { "aria-label": color, title: color } });
+				sw.style.setProperty("--qs-swatch-color", color);
+				sw.onclick = (evt) => {
+					evt.preventDefault();
+					settings.laserColor = color;
+					void this.plugin.saveSettings();
+					this.requestLaserFrame();
+					this.refreshToolbarState();
+				};
+				this.activeChecks.set(sw, () => settings.laserColor.toLowerCase() === color.toLowerCase());
+			}
+			const trails = section("Trail");
+			const options: [LaserTrail, string][] = [
+				["short", "Short trail"],
+				["long", "Long trail"],
+				["hold", "Keep until the next stroke (Esc clears)"],
+			];
+			for (const [value, name] of options) {
+				const b = this.optionButton(trails, name, trailIcon(value), () => {
+					settings.laserTrail = value;
+					void this.plugin.saveSettings();
+					this.fadeLaserTrails();
+				});
+				this.activeChecks.set(b, () => settings.laserTrail === value);
+			}
+			return;
+		}
+
+		if (ctx.stroke) this.buildStrokeSections(ctx, section);
+
+		if (ctx.dash) {
+			const styles = section("Line style");
+			const options: [DashStyle, string][] = [
+				["solid", "Solid"],
+				["dashed", "Dashed"],
+				["dotted", "Dotted"],
+			];
+			for (const [value, name] of options) {
+				const b = this.optionButton(styles, name, dashIcon(value), () => this.pickDash(value));
+				this.activeChecks.set(b, () => this.shownDash() === value);
+			}
+		}
+
+		if (ctx.fill) this.buildFillSection(section);
+		if (ctx.heads) this.buildHeadsSection(section);
+
+		if (ctx.actions) {
+			const acts = section("Selection");
+			this.btn(acts, "Duplicate (Cmd/Ctrl+D)", ICON.duplicate, () => this.duplicateSelection());
+			this.btn(acts, "Copy (Cmd/Ctrl+C)", ICON.copy, () => this.copySelection());
+			this.btn(acts, "Delete (Delete)", ICON.trash, () => this.deleteSelection());
+		}
+	}
+
+	/** Color and size sections. */
+	private buildStrokeSections(ctx: StyleContext, section: (title: string) => HTMLElement): void {
 		const colors = section("Color");
 		colors.addClass("qs-swatches");
 		const palette = ctx.highlight ? HIGHLIGHT_COLORS : this.allColors();
@@ -1078,6 +1378,10 @@ export class DrawingView extends ItemView {
 			}
 			this.activeChecks.set(sw, () => this.shownColor().toLowerCase() === color.toLowerCase());
 		}
+		// One row; two in a narrow pane (see .qs-swatches in styles.css).
+		const count = palette.length + (ctx.highlight ? 0 : 1);
+		colors.style.setProperty("--qs-swatch-cols", String(count));
+		colors.style.setProperty("--qs-swatch-cols-narrow", String(count <= 5 ? count : Math.ceil(count / 2)));
 		if (!ctx.highlight) {
 			const add = colors.createDiv({
 				cls: "quick-sketch-swatch quick-sketch-swatch-add",
@@ -1106,7 +1410,10 @@ export class DrawingView extends ItemView {
 			this.activeChecks.set(b, () => this.shownSize() === size.px);
 		});
 
-		if (ctx.fill) {
+	}
+
+	private buildFillSection(section: (title: string) => HTMLElement): void {
+		{
 			const fills = section("Fill");
 			const options: [FillStyle, string, string][] = [
 				["none", "No fill", fillIcon(0)],
@@ -1119,7 +1426,10 @@ export class DrawingView extends ItemView {
 			}
 		}
 
-		if (ctx.heads) {
+	}
+
+	private buildHeadsSection(section: (title: string) => HTMLElement): void {
+		{
 			const ends = section("Arrowheads");
 			const options: [ArrowHeads, string, string][] = [
 				["none", "No arrowheads", headsIcon(false, false)],
@@ -1130,13 +1440,6 @@ export class DrawingView extends ItemView {
 				const b = this.optionButton(ends, name, svg, () => this.pickHeads(value));
 				this.activeChecks.set(b, () => this.shownHeads() === value);
 			}
-		}
-
-		if (ctx.actions) {
-			const acts = section("Selection");
-			this.btn(acts, "Duplicate (Cmd/Ctrl+D)", ICON.duplicate, () => this.duplicateSelection());
-			this.btn(acts, "Copy (Cmd/Ctrl+C)", ICON.copy, () => this.copySelection());
-			this.btn(acts, "Delete (Delete)", ICON.trash, () => this.deleteSelection());
 		}
 	}
 
@@ -1170,6 +1473,12 @@ export class DrawingView extends ItemView {
 	private pickFill(fill: FillStyle): void {
 		this.currentFill = fill;
 		if (this.editingSelection()) this.applyStyle({ fill });
+		this.refreshToolbarState();
+	}
+
+	private pickDash(dash: DashStyle): void {
+		this.currentDash = dash;
+		if (this.editingSelection()) this.applyStyle({ dash });
 		this.refreshToolbarState();
 	}
 
@@ -1219,6 +1528,7 @@ export class DrawingView extends ItemView {
 	private setTool(tool: Tool): void {
 		if (this.textEditor) this.commitTextEditor();
 		this.tool = tool;
+		if (tool !== "laser") this.clearLaser();
 		if (SHAPE_TOOLS.has(tool)) this.lastShapeTool = tool;
 		if (SELECT_TOOLS.has(tool)) this.lastSelectTool = tool;
 		// A selection only lives in the select tools; elsewhere the style
@@ -1266,7 +1576,7 @@ export class DrawingView extends ItemView {
 			this.elementsGroup.appendChild(pathEl);
 			return;
 		}
-		const firstInk = Array.from(this.elementsGroup.children).find((c) => !c.hasAttribute("data-highlight"));
+		const firstInk = Array.from(this.elementsGroup.children).find((c) => !c.hasAttribute("data-highlight") && c.tagName.toLowerCase() !== "image");
 		this.elementsGroup.insertBefore(pathEl, firstInk ?? null);
 	}
 
@@ -1350,6 +1660,11 @@ export class DrawingView extends ItemView {
 			this.beginMousePan(evt);
 			return;
 		}
+		if (this.tool === "laser") {
+			evt.preventDefault();
+			this.beginLaser(evt);
+			return;
+		}
 		if (this.tool === "eraser") {
 			evt.preventDefault();
 			this.beginErase(evt);
@@ -1406,6 +1721,7 @@ export class DrawingView extends ItemView {
 			highlight,
 			pressure,
 		};
+		if (this.tool === "pencil" && this.plugin.settings.shapeRecognition) this.armRecognizer(p);
 	}
 
 	private onPointerMove = (evt: PointerEvent): void => {
@@ -1425,6 +1741,11 @@ export class DrawingView extends ItemView {
 			this.panX = this.panDrag.startPanX + (p.x - this.panDrag.startWrap.x);
 			this.panY = this.panDrag.startPanY + (p.y - this.panDrag.startWrap.y);
 			this.applyTransform();
+			return;
+		}
+
+		if (this.tool === "laser" && !this.spaceHeld) {
+			this.moveLaser(evt);
 			return;
 		}
 
@@ -1471,6 +1792,8 @@ export class DrawingView extends ItemView {
 		if (evt.pointerType === "pen") this.lastPenActivity = performance.now();
 		const stroke = this.activeStroke;
 		const p = this.toCanvasPoint(evt);
+		const anchor = this.recognizeAnchor;
+		if (anchor && Math.hypot(p.x - anchor.x, p.y - anchor.y) > RECOGNIZE_HOLD_TOLERANCE_PX / this.zoom) this.armRecognizer(p);
 		const last = stroke.points[stroke.points.length - 1];
 		const dx = p.x - last.x;
 		const dy = p.y - last.y;
@@ -1526,6 +1849,15 @@ export class DrawingView extends ItemView {
 		if (this.panDrag && evt.pointerId === this.panDrag.pointerId) {
 			this.releaseCapture(evt.pointerId);
 			this.panDrag = null;
+			return;
+		}
+
+		if (this.laser && evt.pointerId === this.laser.pointerId) {
+			this.releaseCapture(evt.pointerId);
+			this.laser.pointerId = null;
+			// A lifted pencil is gone (unless it hovers again); a mouse stays.
+			if (evt.pointerType !== "mouse" || evt.type === "pointercancel") this.laser.dot = null;
+			this.requestLaserFrame();
 			return;
 		}
 
@@ -1599,6 +1931,7 @@ export class DrawingView extends ItemView {
 	}
 
 	private finishActiveStroke(): void {
+		this.disarmRecognizer();
 		if (!this.activeStroke) return;
 		this.releaseCapture(this.activeStroke.pointerId);
 		// Simplify once at the end rather than live, so the ink under the pen
@@ -1654,6 +1987,9 @@ export class DrawingView extends ItemView {
 		const radius = ERASE_RADIUS_PX / this.zoom;
 		const hitIdx: number[] = [];
 		for (let i = this.elements.length - 1; i >= 0; i--) {
+			// Images are only removed via select + delete, so erasing ink drawn
+			// over a screenshot never takes the screenshot with it.
+			if (this.elements[i].kind === "image") continue;
 			if (elementHit(this.elements[i], p.x, p.y, radius)) hitIdx.push(i);
 		}
 		if (hitIdx.length === 0) return;
@@ -1684,6 +2020,7 @@ export class DrawingView extends ItemView {
 		const kind: ShapeKind = isLine ? "arrow" : (this.tool as ShapeKind);
 		const data: ShapeData = { kind, color: this.currentColor, size: this.currentSize, x0: p.x, y0: p.y, x1: p.x, y1: p.y };
 		if (CLOSED_SHAPE_TOOLS.has(this.tool) && this.currentFill !== "none") data.fill = this.currentFill;
+		if (this.currentDash !== "solid") data.dash = this.currentDash;
 		if (isLine) {
 			data.heads = this.tool === "line" ? "none" : this.currentArrowHeads;
 			data.startBind = this.bindTargetAt(p)?.id;
@@ -1944,7 +2281,7 @@ export class DrawingView extends ItemView {
 			const now = performance.now();
 			const tap = this.lastSelectTap;
 			this.lastSelectTap = { id: hit.id, time: now };
-			if (tap && tap.id === hit.id && now - tap.time < DOUBLE_TAP_MS && hit.kind !== "freehand" && !additive) {
+			if (tap && tap.id === hit.id && now - tap.time < DOUBLE_TAP_MS && hit.kind !== "freehand" && hit.kind !== "image" && !additive) {
 				this.lastSelectTap = null;
 				this.releaseCapture(evt.pointerId);
 				this.selectionDrag = null;
@@ -2093,8 +2430,8 @@ export class DrawingView extends ItemView {
 		let sx = b.width > 0 ? (x1 - x0) / b.width : 1;
 		let sy = b.height > 0 ? (y1 - y0) / b.height : 1;
 		const corner = h.length === 2;
-		const allText = this.selectedElements().every((e) => e.kind === "text");
-		if (corner && (evt.shiftKey || allText)) {
+		const keepAspect = this.selectedElements().every((e) => e.kind === "text" || e.kind === "image");
+		if (corner && (evt.shiftKey || keepAspect)) {
 			const s = Math.max(sx, sy);
 			sx = sy = s;
 			if (h.includes("w")) x0 = x1 - b.width * s;
@@ -2377,6 +2714,7 @@ export class DrawingView extends ItemView {
 			return this.createFromSerialized(copy);
 		});
 		this.elements.push(...created);
+		this.imagesFirst();
 		if (!SELECT_TOOLS.has(this.tool)) this.setTool("select");
 		this.selectedIds = new Set(created.map((e) => e.id));
 		this.updateAllBindings();
@@ -2386,7 +2724,7 @@ export class DrawingView extends ItemView {
 
 	// --- Restyling the selection ---
 
-	private applyStyle(patch: { color?: string; sizePx?: number; fill?: FillStyle; heads?: ArrowHeads }): void {
+	private applyStyle(patch: { color?: string; sizePx?: number; fill?: FillStyle; heads?: ArrowHeads; dash?: DashStyle }): void {
 		const sel = this.selectedElements();
 		if (sel.length === 0) return;
 		this.pushUndoSnapshot();
@@ -2394,6 +2732,7 @@ export class DrawingView extends ItemView {
 		for (const elem of sel) {
 			const s = snaps.get(elem.id);
 			if (!s) continue;
+			if (s.kind === "image") continue;
 			if (patch.color) s.color = patch.color;
 			if (patch.sizePx !== undefined) {
 				const px = patch.sizePx;
@@ -2408,6 +2747,9 @@ export class DrawingView extends ItemView {
 				s.fill = patch.fill === "none" ? undefined : patch.fill;
 			}
 			if (patch.heads && s.kind === "arrow") s.heads = patch.heads;
+			if (patch.dash && s.kind !== "freehand" && s.kind !== "text") {
+				s.dash = patch.dash === "solid" ? undefined : patch.dash;
+			}
 			this.replaceElement(elem, s);
 		}
 		this.updateAllBindings();
@@ -2510,6 +2852,173 @@ export class DrawingView extends ItemView {
 			this.updateArrowBindings(elem);
 			this.applyGeometry(elem);
 		}
+	}
+
+	// --- Laser pointer (for presenting) ---
+
+	private ensureLaser(): LaserState | null {
+		if (this.laser) return this.laser;
+		const canvas = this.canvasWrapEl.createEl("canvas", { cls: "qs-laser-canvas" });
+		const ctx = canvas.getContext("2d");
+		if (!ctx) {
+			canvas.remove();
+			return null;
+		}
+		this.laser = { canvas, ctx, trails: [], pointerId: null, dot: null, rafId: null };
+		return this.laser;
+	}
+
+	private beginLaser(evt: PointerEvent): void {
+		const laser = this.ensureLaser();
+		if (!laser) return;
+		if (evt.pointerType === "pen") this.lastPenActivity = performance.now();
+		this.canvasWrapEl.setPointerCapture(evt.pointerId);
+		const p = this.toWrapPoint(evt);
+		const now = performance.now();
+		// "Hold" trails stay until the next stroke starts; then they fade.
+		for (const trail of laser.trails) if (trail.fadeFrom === null) trail.fadeFrom = now;
+		laser.pointerId = evt.pointerId;
+		laser.dot = p;
+		laser.trails.push({ points: [{ x: p.x, y: p.y, t: now }], fadeFrom: null });
+		this.requestLaserFrame();
+	}
+
+	/** Pressed: extend the trail. Hovering (mouse, or a pencil that supports
+	 * hover): just move the dot. */
+	private moveLaser(evt: PointerEvent): void {
+		const laser = this.ensureLaser();
+		if (!laser) return;
+		if (laser.pointerId !== null && evt.pointerId !== laser.pointerId) return;
+		const p = this.toWrapPoint(evt);
+		laser.dot = p;
+		if (laser.pointerId !== null) {
+			if (evt.pointerType === "pen") this.lastPenActivity = performance.now();
+			// Coalesced events give a smoother trail from fast pen movement.
+			const events = typeof evt.getCoalescedEvents === "function" ? evt.getCoalescedEvents() : [];
+			const trail = laser.trails[laser.trails.length - 1];
+			const now = performance.now();
+			for (const e of events.length > 0 ? events : [evt]) {
+				const q = this.toWrapPoint(e);
+				trail.points.push({ x: q.x, y: q.y, t: now });
+			}
+		}
+		this.requestLaserFrame();
+	}
+
+	private onPointerLeave = (evt: PointerEvent): void => {
+		if (!this.laser || evt.pointerType === "touch" || this.laser.pointerId !== null) return;
+		this.laser.dot = null;
+		this.requestLaserFrame();
+	};
+
+	/** Fades out every trail (Escape, or "hold" trails on demand). */
+	private fadeLaserTrails(): void {
+		const laser = this.laser;
+		if (!laser) return;
+		const now = performance.now();
+		for (const trail of laser.trails) if (trail.fadeFrom === null) trail.fadeFrom = now;
+		this.requestLaserFrame();
+	}
+
+	private requestLaserFrame(): void {
+		const laser = this.laser;
+		if (!laser || laser.rafId !== null) return;
+		laser.rafId = requestAnimationFrame(() => {
+			laser.rafId = null;
+			this.drawLaser();
+		});
+	}
+
+	/** Redraws the dot and the trails; keeps animating while any trail is
+	 * still fading. */
+	private drawLaser(): void {
+		const laser = this.laser;
+		if (!laser) return;
+		const { canvas, ctx } = laser;
+		const dpr = window.devicePixelRatio || 1;
+		const w = this.canvasWrapEl.clientWidth;
+		const h = this.canvasWrapEl.clientHeight;
+		if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+			canvas.width = Math.round(w * dpr);
+			canvas.height = Math.round(h * dpr);
+		}
+		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		ctx.clearRect(0, 0, w, h);
+
+		const rgb = hexToRgb(this.plugin.settings.laserColor) ?? "255, 40, 40";
+		const mode = this.plugin.settings.laserTrail;
+		const fadeMs = LASER_TRAIL_MS[mode];
+		const now = performance.now();
+		let animating = false;
+
+		// Expire what has faded. A trail being drawn keeps its newest point
+		// so the dot stays attached to it while the pointer rests.
+		laser.trails = laser.trails.filter((trail, i) => {
+			const live = laser.pointerId !== null && i === laser.trails.length - 1;
+			if (trail.fadeFrom !== null) return now - trail.fadeFrom < LASER_HOLD_FADE_MS;
+			if (mode === "hold") return true;
+			const kept = trail.points.filter((pt) => now - pt.t < fadeMs);
+			if (live && kept.length === 0) kept.push({ ...trail.points[trail.points.length - 1], t: now });
+			trail.points = kept;
+			return kept.length > 0;
+		});
+
+		ctx.lineCap = "round";
+		ctx.lineJoin = "round";
+		for (const trail of laser.trails) {
+			// A whole trail fading out (after "hold", or Escape)...
+			const trailLife = trail.fadeFrom === null ? 1 : 1 - (now - trail.fadeFrom) / LASER_HOLD_FADE_MS;
+			if (trail.fadeFrom !== null) animating = true;
+			const pts = trail.points;
+			for (let i = 1; i < pts.length; i++) {
+				// ...and, while fading by age, its tail thinning out behind it.
+				const age = mode === "hold" || trail.fadeFrom !== null ? 0 : (now - pts[i].t) / fadeMs;
+				const life = Math.min(trailLife, 1 - age);
+				if (life <= 0) continue;
+				if (age > 0) animating = true;
+				ctx.beginPath();
+				ctx.moveTo(pts[i - 1].x, pts[i - 1].y);
+				ctx.lineTo(pts[i].x, pts[i].y);
+				// Soft glow, then a bright core.
+				ctx.strokeStyle = `rgba(${rgb}, ${0.25 * life})`;
+				ctx.lineWidth = LASER_WIDTH_PX * 2.6 * life;
+				ctx.stroke();
+				ctx.strokeStyle = `rgba(${rgb}, ${life})`;
+				ctx.lineWidth = LASER_WIDTH_PX * life;
+				ctx.stroke();
+			}
+		}
+
+		if (laser.dot) {
+			const { x, y } = laser.dot;
+			const glow = ctx.createRadialGradient(x, y, 0, x, y, LASER_WIDTH_PX * 2.5);
+			glow.addColorStop(0, `rgba(${rgb}, 0.55)`);
+			glow.addColorStop(1, `rgba(${rgb}, 0)`);
+			ctx.fillStyle = glow;
+			ctx.beginPath();
+			ctx.arc(x, y, LASER_WIDTH_PX * 2.5, 0, Math.PI * 2);
+			ctx.fill();
+			ctx.fillStyle = `rgb(${rgb})`;
+			ctx.beginPath();
+			ctx.arc(x, y, LASER_WIDTH_PX * 0.8, 0, Math.PI * 2);
+			ctx.fill();
+			ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+			ctx.beginPath();
+			ctx.arc(x, y, LASER_WIDTH_PX * 0.35, 0, Math.PI * 2);
+			ctx.fill();
+		}
+
+		if (animating) this.requestLaserFrame();
+	}
+
+	/** Removes the laser overlay entirely (on leaving the tool / closing). */
+	private clearLaser(): void {
+		const laser = this.laser;
+		if (!laser) return;
+		if (laser.rafId !== null) cancelAnimationFrame(laser.rafId);
+		if (laser.pointerId !== null) this.releaseCapture(laser.pointerId);
+		laser.canvas.remove();
+		this.laser = null;
 	}
 
 	// --- Touch: pan with one finger, pinch-zoom with two. Never draws. ---
@@ -2679,6 +3188,8 @@ export class DrawingView extends ItemView {
 				heads: elem.heads,
 				startBind: elem.startBind,
 				endBind: elem.endBind,
+				dash: elem.dash,
+				href: elem.href,
 			};
 		});
 	}
@@ -2762,12 +3273,32 @@ export class DrawingView extends ItemView {
 			}
 			return;
 		}
-		if (mod && !e.shiftKey && !e.altKey && ["a", "c", "x", "v", "d"].includes(k)) {
+		if (e.key === "Escape" && this.plugin.settings.laserTrail === "hold" && this.laser?.trails.some((t) => t.fadeFrom === null)) {
+			e.preventDefault();
+			this.fadeLaserTrails();
+			return;
+		}
+		if (e.key === "Escape" && this.presenting) {
+			e.preventDefault();
+			this.exitPresentation();
+			return;
+		}
+		if (mod && !e.shiftKey && !e.altKey && k === "v") {
+			// Not prevented, so the browser still fires a paste event: an image
+			// on the system clipboard is inserted from there (handlePaste),
+			// otherwise copied elements are pasted once it's clear none came.
+			if (this.pasteFallbackTimer !== null) window.clearTimeout(this.pasteFallbackTimer);
+			this.pasteFallbackTimer = window.setTimeout(() => {
+				this.pasteFallbackTimer = null;
+				this.paste();
+			}, 100);
+			return;
+		}
+		if (mod && !e.shiftKey && !e.altKey && ["a", "c", "x", "d"].includes(k)) {
 			e.preventDefault();
 			if (k === "a") this.selectAll();
 			else if (k === "c") this.copySelection();
 			else if (k === "x") this.cutSelection();
-			else if (k === "v") this.paste();
 			else this.duplicateSelection();
 			return;
 		}
@@ -2943,7 +3474,7 @@ export class DrawingView extends ItemView {
 	 * drawn. Every element's geometry is recoverable from its native SVG
 	 * attributes -- freehand raw points included, since buildSmoothPath's
 	 * `d` encodes them exactly (see parseSmoothPath). */
-	private exportCroppedSvg(): string {
+	private exportCroppedSvg(clean = false): string {
 		const bbox = this.elementsGroup.getBBox();
 		const hasContent = bbox.width > 0 || bbox.height > 0;
 
@@ -2958,6 +3489,7 @@ export class DrawingView extends ItemView {
 		exportSvg.setAttribute("width", String(Math.round(width)));
 		exportSvg.setAttribute("height", String(Math.round(height)));
 		exportSvg.innerHTML = this.elementsGroup.innerHTML;
+		if (!clean) exportSvg.setAttribute("data-paper", this.paper);
 		// Element ids are only needed by arrows attached to them.
 		const referenced = new Set<string>();
 		for (const e of this.elements) {
@@ -2978,6 +3510,26 @@ export class DrawingView extends ItemView {
 		for (const child of Array.from(exportSvg.children)) {
 			for (const [attr, value] of Object.entries(shared)) {
 				if (child.getAttribute(attr) === value) child.removeAttribute(attr);
+			}
+		}
+
+		if (this.paper !== "none" && this.plugin.settings.paperInExport) {
+			const bg = document.createElementNS(SVG_NS, "rect");
+			bg.setAttribute("data-paper-bg", "true");
+			bg.setAttribute("x", fmt(x));
+			bg.setAttribute("y", fmt(y));
+			bg.setAttribute("width", fmt(width));
+			bg.setAttribute("height", fmt(height));
+			bg.setAttribute("fill", "url(#qs-paper)");
+			const defs = document.createElementNS(SVG_NS, "defs");
+			defs.innerHTML = paperPattern(this.paper);
+			exportSvg.prepend(defs, bg);
+		}
+
+		// Exports for other apps: without our own bookkeeping attributes.
+		if (clean) {
+			for (const el of [exportSvg, ...Array.from(exportSvg.querySelectorAll("*"))]) {
+				for (const attr of Array.from(el.attributes)) if (attr.name.startsWith("data-")) el.removeAttribute(attr.name);
 			}
 		}
 
@@ -3002,21 +3554,11 @@ export class DrawingView extends ItemView {
 		);
 	}
 
-	/** Saves the drawing as a PNG next to its SVG (overwriting an earlier
-	 * export of the same drawing). */
+	/** Exports the drawing as a PNG wherever the user chooses. */
 	async exportPng(): Promise<void> {
 		if (this.textEditor) this.commitTextEditor();
-		if (!this.filePath) return;
-		try {
-			const png = await (await this.pngOf(this.exportCroppedSvg())).arrayBuffer();
-			const path = normalizePath(this.filePath.replace(/\.svg$/i, "") + ".png");
-			const existing = this.app.vault.getAbstractFileByPath(path);
-			if (existing instanceof TFile) await this.app.vault.modifyBinary(existing, png);
-			else await this.app.vault.createBinary(path, png);
-			new Notice(`Exported ${path}`);
-		} catch (err) {
-			new Notice(`Couldn't export the drawing: ${(err as Error).message}`);
-		}
+		const svg = this.exportCroppedSvg();
+		await this.runExport("png", "image/png", "PNG image", () => this.pngOf(svg));
 	}
 
 	/** Recomputes an element's rendered SVG attributes from its geometry
@@ -3072,6 +3614,11 @@ export class DrawingView extends ItemView {
 			polygon.setAttribute("points", `${fmt(midX)},${fmt(minY)} ${fmt(minX)},${fmt(maxY)} ${fmt(maxX)},${fmt(maxY)}`);
 		} else if (elem.kind === "arrow") {
 			this.applyArrowGeometry(elem);
+		} else if (elem.kind === "image") {
+			elem.el.setAttribute("x", fmt(minX));
+			elem.el.setAttribute("y", fmt(minY));
+			elem.el.setAttribute("width", fmt(maxX - minX));
+			elem.el.setAttribute("height", fmt(maxY - minY));
 		}
 		this.applyLabelGeometry(elem);
 	}
@@ -3283,6 +3830,11 @@ export class DrawingView extends ItemView {
 			el.setAttribute("stroke-width", String(size));
 			el.setAttribute("fill", "none");
 			el.setAttribute("stroke-linejoin", "round");
+		} else if (kind === "image") {
+			el = document.createElementNS(SVG_NS, "image") as SVGImageElement;
+			el.setAttribute("href", data.href ?? "");
+			// The box is the image's size; resizing it stretches the picture.
+			el.setAttribute("preserveAspectRatio", "none");
 		} else {
 			// Arrow: a <g> wrapping a shaft <line> and a solid-filled arrowhead
 			// <polygon>, rather than an SVG <marker> -- avoids marker/defs
@@ -3298,7 +3850,21 @@ export class DrawingView extends ItemView {
 			// Arrowheads are added by applyArrowGeometry, per `heads`.
 			el = g;
 		}
-		this.elementsGroup.appendChild(el);
+		if (kind === "image") {
+			// Pictures sit beneath everything drawn, so you can draw over them.
+			const firstNonImage = Array.from(this.elementsGroup.children).find((c) => c.tagName.toLowerCase() !== "image");
+			this.elementsGroup.insertBefore(el, firstNonImage ?? null);
+		} else {
+			this.elementsGroup.appendChild(el);
+		}
+		const dash = kind === "image" ? undefined : data.dash;
+		const pattern = dashArray(dash, size);
+		if (pattern) {
+			const stroked = kind === "arrow" ? el.querySelector("line") : el;
+			stroked?.setAttribute("stroke-dasharray", pattern);
+			stroked?.setAttribute("stroke-linecap", "round");
+			el.setAttribute("data-dash", dash as string);
+		}
 		const elem: ShapeElement = {
 			id: id ?? uid(),
 			kind,
@@ -3313,6 +3879,8 @@ export class DrawingView extends ItemView {
 			heads: kind === "arrow" ? data.heads : undefined,
 			startBind: kind === "arrow" ? data.startBind : undefined,
 			endBind: kind === "arrow" ? data.endBind : undefined,
+			dash,
+			href: kind === "image" ? data.href : undefined,
 		};
 		if (kind !== "arrow") {
 			// Lets arrows in the saved file refer to this shape.
@@ -3389,6 +3957,14 @@ export class DrawingView extends ItemView {
 		} catch {
 			root = null;
 		}
+		const savedPaper = root?.getAttribute("data-paper");
+		this.paper =
+			savedPaper === "none" || savedPaper === "dots" || savedPaper === "grid" || savedPaper === "lines"
+				? savedPaper
+				: root && root.children.length > 0
+					? "none"
+					: this.plugin.settings.defaultPaper;
+		this.applyPaper();
 		if (!root) return;
 
 		type RawElement =
@@ -3404,6 +3980,10 @@ export class DrawingView extends ItemView {
 			return parseFloat(el.getAttribute("fill-opacity") ?? "1") < 1 ? "light" : "solid";
 		};
 		const readId = (el: Element) => el.getAttribute("data-id") ?? undefined;
+		const readDash = (el: Element): DashStyle | undefined => {
+			const d = el.getAttribute("data-dash");
+			return d === "dashed" || d === "dotted" ? d : undefined;
+		};
 
 		const raw: RawElement[] = [];
 		// Every element this plugin writes is a direct child of the exported
@@ -3419,7 +3999,16 @@ export class DrawingView extends ItemView {
 		);
 		for (const child of children) {
 			const tag = child.tagName.toLowerCase();
-			if (tag === "path" && child.hasAttribute("data-line")) {
+			// The saved background paper (and its pattern) isn't an element.
+			if (child.hasAttribute("data-paper-bg") || tag === "defs") continue;
+			if (tag === "image") {
+				const href = child.getAttribute("href") ?? child.getAttributeNS("http://www.w3.org/1999/xlink", "href") ?? "";
+				const x = parseFloat(child.getAttribute("x") ?? "0");
+				const y = parseFloat(child.getAttribute("y") ?? "0");
+				const w = parseFloat(child.getAttribute("width") ?? "0");
+				const h = parseFloat(child.getAttribute("height") ?? "0");
+				if (href && w > 0 && h > 0) raw.push({ kind: "image", color: DEFAULT_COLOR, size: 0, x0: x, y0: y, x1: x + w, y1: y + h, href, id: readId(child) });
+			} else if (tag === "path" && child.hasAttribute("data-line")) {
 				// Pressure stroke: a filled outline, with its centerline and
 				// pressures saved alongside.
 				const points = parseSmoothPath(child.getAttribute("data-line") ?? "") ?? [];
@@ -3453,7 +4042,7 @@ export class DrawingView extends ItemView {
 				const y = parseFloat(child.getAttribute("y") ?? "0");
 				const w = parseFloat(child.getAttribute("width") ?? "0");
 				const h = parseFloat(child.getAttribute("height") ?? "0");
-				raw.push({ kind: "rectangle", color, size, x0: x, y0: y, x1: x + w, y1: y + h, fill: readFill(child), id: readId(child) });
+				raw.push({ kind: "rectangle", color, size, x0: x, y0: y, x1: x + w, y1: y + h, fill: readFill(child), dash: readDash(child), id: readId(child) });
 			} else if (tag === "ellipse") {
 				const color = child.getAttribute("stroke") ?? DEFAULT_COLOR;
 				const size = parseFloat(child.getAttribute("stroke-width") ?? "") || DEFAULT_STROKE_PX;
@@ -3470,6 +4059,7 @@ export class DrawingView extends ItemView {
 					x1: cx + rx,
 					y1: cy + ry,
 					fill: readFill(child),
+					dash: readDash(child),
 					id: readId(child),
 				});
 			} else if (tag === "polygon") {
@@ -3489,7 +4079,7 @@ export class DrawingView extends ItemView {
 					const minY = Math.min(...pts.map((p) => p.y));
 					const maxY = Math.max(...pts.map((p) => p.y));
 					const kind = pts.length === 3 ? "triangle" : "diamond";
-					raw.push({ kind, color, size, x0: minX, y0: minY, x1: maxX, y1: maxY, fill: readFill(child), id: readId(child) });
+					raw.push({ kind, color, size, x0: minX, y0: minY, x1: maxX, y1: maxY, fill: readFill(child), dash: readDash(child), id: readId(child) });
 				}
 			} else if (tag === "g" && child.getAttribute("data-kind") === "arrow") {
 				const line = child.querySelector("line");
@@ -3512,6 +4102,7 @@ export class DrawingView extends ItemView {
 					heads: heads === "none" || heads === "both" ? heads : undefined,
 					startBind: child.getAttribute("data-start") ?? undefined,
 					endBind: child.getAttribute("data-end") ?? undefined,
+					dash: readDash(child),
 				});
 			} else if (tag === "text" && child.hasAttribute("data-label")) {
 				// A shape's label always directly follows its shape.
@@ -3558,8 +4149,9 @@ export class DrawingView extends ItemView {
 				consider(r.x1, r.y1);
 			}
 		}
-		const dx = Math.round(WORKSPACE_CENTER - (minX + maxX) / 2);
-		const dy = Math.round(WORKSPACE_CENTER - (minY + maxY) / 2);
+		// Shifted by whole paper tiles, so writing stays on the same lines.
+		const dx = Math.round((WORKSPACE_CENTER - (minX + maxX) / 2) / PAPER_ALIGN) * PAPER_ALIGN;
+		const dy = Math.round((WORKSPACE_CENTER - (minY + maxY) / 2) / PAPER_ALIGN) * PAPER_ALIGN;
 
 		this.elements = raw.map((r) => {
 			if (r.kind === "freehand") {
@@ -3577,6 +4169,227 @@ export class DrawingView extends ItemView {
 			const { id, ...data } = r;
 			return this.createShapeElement({ ...data, x0: r.x0 + dx, y0: r.y0 + dy, x1: r.x1 + dx, y1: r.y1 + dy }, id);
 		});
+	}
+
+	// --- More exports ---
+
+	/** Copies the drawing to the clipboard as SVG markup. */
+	copyAsSvg(): void {
+		if (this.textEditor) this.commitTextEditor();
+		navigator.clipboard.writeText(this.exportCroppedSvg(true)).then(
+			() => new Notice("Drawing copied as SVG."),
+			(err: Error) => new Notice(`Couldn't copy the drawing: ${err.message}`)
+		);
+	}
+
+	/** Saves an export where the user picks (Save dialog on desktop, share
+	 * sheet on iPad -- see saveExport), or else next to the drawing in the
+	 * vault. Called straight from the click: the dialogs need that. */
+	private async runExport(ext: "png" | "svg" | "pdf", mime: string, description: string, make: () => Promise<Blob>): Promise<void> {
+		if (!this.filePath) return;
+		const base = (this.filePath.split("/").pop() ?? "Drawing").replace(/\.svg$/i, "");
+		const name = ext === "svg" ? `${base} (export).svg` : `${base}.${ext}`;
+		try {
+			await saveExport(this.app, { name, mime, description, make }, async (blob) => {
+				const path = normalizePath(`${(this.filePath ?? "").replace(/[^/]*$/, "")}${name}`);
+				const data = await blob.arrayBuffer();
+				const existing = this.app.vault.getAbstractFileByPath(path);
+				if (existing instanceof TFile) await this.app.vault.modifyBinary(existing, data);
+				else await this.app.vault.createBinary(path, data);
+				new Notice(`Exported ${path}`);
+			});
+		} catch (err) {
+			new Notice(`Couldn't export the drawing: ${(err as Error).message}`);
+		}
+	}
+
+	async exportSvg(): Promise<void> {
+		if (this.textEditor) this.commitTextEditor();
+		const svg = this.exportCroppedSvg(true);
+		await this.runExport("svg", "image/svg+xml", "SVG image", async () => new Blob([svg], { type: "image/svg+xml" }));
+	}
+
+	/** A one-page PDF the size of the drawing. The drawing is embedded as an
+	 * image (at the PNG export resolution, at least 2x), on white. */
+	async exportPdf(): Promise<void> {
+		if (this.textEditor) this.commitTextEditor();
+		const svg = this.exportCroppedSvg();
+		await this.runExport("pdf", "application/pdf", "PDF document", async () => {
+			const w = parseFloat(/width="([\d.]+)"/.exec(svg)?.[1] ?? "") || EMPTY_EXPORT_WIDTH;
+			const h = parseFloat(/height="([\d.]+)"/.exec(svg)?.[1] ?? "") || EMPTY_EXPORT_HEIGHT;
+			const scale = Math.max(2, this.plugin.settings.pngScale || 2);
+			const canvas = await svgToCanvas(svg, w, h, scale, "#ffffff");
+			// CSS px -> PDF points (1/72 in), at 96 px per inch.
+			return new Blob([await canvasToPdf(canvas, w * 0.75, h * 0.75)], { type: "application/pdf" });
+		});
+	}
+
+	// --- Background paper ---
+
+	private setPaper(paper: Paper): void {
+		if (paper === this.paper) return;
+		this.paper = paper;
+		this.applyPaper();
+		this.markDirtyAndScheduleSave();
+	}
+
+	/** The paper shown while editing is a CSS background on the canvas --
+	 * cheap to draw, and it pans and zooms along with it. */
+	private applyPaper(): void {
+		if (!this.svgEl) return;
+		for (const p of ["dots", "grid", "lines"]) this.svgEl.classList.toggle(`qs-paper-${p}`, this.paper === p);
+	}
+
+	// --- Images ---
+
+	/** Opens the system picker (photos/files on iPad) for "Insert image". */
+	pickImageFile(): void {
+		this.imageInputEl?.click();
+	}
+
+	private handlePaste(e: ClipboardEvent): void {
+		if (!this.isActiveLeaf() || this.isEditableTarget(e.target)) return;
+		const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith("image/"));
+		if (files.length === 0) return;
+		e.preventDefault();
+		// An image arrived: it wins over any copied elements.
+		if (this.pasteFallbackTimer !== null) {
+			window.clearTimeout(this.pasteFallbackTimer);
+			this.pasteFallbackTimer = null;
+		}
+		void this.insertImageFiles(files);
+	}
+
+	/** Inserts images centered on `at` (canvas coordinates; default: the
+	 * middle of the view), each a little offset from the one before. */
+	private async insertImageFiles(files: File[], at?: Point): Promise<void> {
+		const wrap = this.canvasWrapEl;
+		const center = at ?? { x: (wrap.clientWidth / 2 - this.panX) / this.zoom, y: (wrap.clientHeight / 2 - this.panY) / this.zoom };
+		const ids: string[] = [];
+		let i = 0;
+		for (const file of files) {
+			if (!file.type.startsWith("image/")) continue;
+			try {
+				const { href, width, height } = await loadImageFile(file);
+				const offset = PASTE_OFFSET * i++;
+				ids.push(this.insertImage(href, width, height, { x: center.x + offset, y: center.y + offset }, ids.length === 0));
+			} catch (err) {
+				new Notice(`Couldn't insert ${file.name || "the image"}: ${(err as Error).message}`);
+			}
+		}
+		if (ids.length === 0) return;
+		if (!SELECT_TOOLS.has(this.tool)) this.setTool("select");
+		this.selectedIds = new Set(ids);
+		this.renderSelectionOverlay();
+		this.markDirtyAndScheduleSave();
+	}
+
+	/** Adds one image, scaled down to fit the view; returns its id. */
+	private insertImage(href: string, width: number, height: number, center: Point, snapshot: boolean): string {
+		if (this.textEditor) this.commitTextEditor();
+		if (snapshot) this.pushUndoSnapshot();
+		const wrap = this.canvasWrapEl;
+		const k = Math.min(1, (wrap.clientWidth * IMAGE_VIEW_FRACTION) / this.zoom / width, (wrap.clientHeight * IMAGE_VIEW_FRACTION) / this.zoom / height);
+		const w = round1(width * k);
+		const h = round1(height * k);
+		const x0 = round1(center.x - w / 2);
+		const y0 = round1(center.y - h / 2);
+		const elem = this.createShapeElement({ kind: "image", color: DEFAULT_COLOR, size: 0, x0, y0, x1: x0 + w, y1: y0 + h, href });
+		this.elements.push(elem);
+		this.imagesFirst();
+		return elem.id;
+	}
+
+	/** Keeps images at the start of the element list (= the bottom of the
+	 * stack, matching where createShapeElement puts them in the DOM). */
+	private imagesFirst(): void {
+		this.elements = [...this.elements.filter((e) => e.kind === "image"), ...this.elements.filter((e) => e.kind !== "image")];
+	}
+
+	// --- Shape recognition (hold the pen still at the end of a stroke) ---
+
+	private armRecognizer(p: Point): void {
+		this.disarmRecognizer();
+		this.recognizeAnchor = p;
+		this.recognizeTimer = window.setTimeout(() => {
+			this.recognizeTimer = null;
+			this.recognizeActiveStroke();
+		}, RECOGNIZE_HOLD_MS);
+	}
+
+	private disarmRecognizer(): void {
+		if (this.recognizeTimer !== null) window.clearTimeout(this.recognizeTimer);
+		this.recognizeTimer = null;
+		this.recognizeAnchor = null;
+	}
+
+	/** Swaps the stroke being drawn for the clean shape it looks like (if
+	 * any). The pen is still down; the rest of that contact is ignored. */
+	private recognizeActiveStroke(): void {
+		const stroke = this.activeStroke;
+		if (!stroke || stroke.highlight) return;
+		// Not a shape: keep the anchor, so moving on re-arms the timer.
+		const shape = recognizeShape(stroke.points, RECOGNIZE_MIN_SIZE_PX / this.zoom);
+		if (!shape) return;
+		this.recognizeAnchor = null;
+		stroke.pathEl.remove();
+		this.releaseCapture(stroke.pointerId);
+		this.activeStroke = null;
+		const data: ShapeData = {
+			kind: shape.kind,
+			color: stroke.color,
+			size: this.currentSize,
+			x0: round1(shape.x0),
+			y0: round1(shape.y0),
+			x1: round1(shape.x1),
+			y1: round1(shape.y1),
+		};
+		if (shape.kind === "arrow") data.heads = "none";
+		this.elements.push(this.createShapeElement(data));
+		this.markDirtyAndScheduleSave();
+	}
+
+	// --- Presentation mode ---
+
+	togglePresentation(): void {
+		if (this.presenting) this.exitPresentation();
+		else this.enterPresentation();
+	}
+
+	/** Hides the toolbars, fits the drawing to the view and picks the laser.
+	 * On desktop the drawing also goes full screen. */
+	private enterPresentation(): void {
+		if (this.presenting) return;
+		if (this.textEditor) this.commitTextEditor();
+		this.presenting = true;
+		this.toolBeforePresenting = this.tool;
+		this.setTool("laser");
+		this.contentEl.addClass("qs-presenting");
+		const exit = this.contentEl.createEl("button", {
+			cls: "qs-present-exit",
+			attr: { "aria-label": "Exit presentation (Esc)", title: "Exit presentation (Esc)" },
+		});
+		setIcon(exit, ICON.close);
+		exit.onclick = (evt) => {
+			evt.preventDefault();
+			this.exitPresentation();
+		};
+		this.presentExitEl = exit;
+		if (Platform.isDesktopApp && this.contentEl.requestFullscreen) {
+			this.contentEl.requestFullscreen().catch(() => undefined);
+		}
+		requestAnimationFrame(() => this.zoomToFit());
+	}
+
+	private exitPresentation(): void {
+		if (!this.presenting) return;
+		this.presenting = false;
+		this.contentEl.removeClass("qs-presenting");
+		this.presentExitEl?.remove();
+		this.presentExitEl = null;
+		if (document.fullscreenElement === this.contentEl) document.exitFullscreen().catch(() => undefined);
+		this.setTool(this.toolBeforePresenting ?? DEFAULT_TOOL);
+		this.toolBeforePresenting = null;
 	}
 
 	/** Resets zoom to 100% and recenters the viewport on the drawing's actual

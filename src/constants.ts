@@ -17,6 +17,7 @@ export type Tool =
 	| "select"
 	| "lasso"
 	| "pan"
+	| "laser"
 	| "rectangle"
 	| "ellipse"
 	| "diamond"
@@ -66,6 +67,44 @@ export const SELECT_HIT_RADIUS_PX = 6;
 // Text tool reuses the pencil size buttons (S/M/L) for font size, scaled up
 // by this factor -- a stroke width of 2-10px isn't legible as text size.
 export const TEXT_SIZE_MULTIPLIER = 6;
+
+// Laser pointer (presenting). The trail is drawn this wide (screen px) at
+// its freshest point, and fades out after LASER_TRAILS[...].ms -- or, for
+// "hold", stays until the next stroke starts (then fades over HOLD_FADE_MS).
+export const LASER_WIDTH_PX = 5;
+export const LASER_COLORS: string[] = [
+	"#ff2828", // red
+	"#22d34f", // green
+	"#2f8bff", // blue
+	"#ff2bd6", // magenta
+];
+export type LaserTrail = "short" | "long" | "hold";
+export const LASER_TRAIL_MS: Record<LaserTrail, number> = { short: 700, long: 2000, hold: 0 };
+export const LASER_HOLD_FADE_MS = 500;
+
+// Shape recognition: holding the pen still (within HOLD_TOLERANCE_PX screen
+// px) for HOLD_MS at the end of a pen stroke snaps it to a clean shape, if it
+// looks like one. Strokes smaller than MIN_SIZE_PX on screen are left alone.
+export const RECOGNIZE_HOLD_MS = 550;
+export const RECOGNIZE_HOLD_TOLERANCE_PX = 4;
+export const RECOGNIZE_MIN_SIZE_PX = 24;
+
+// Background paper: shown behind the drawing (and optionally saved with it).
+// Its pattern is anchored at workspace (0, 0); loading a file recenters it by
+// a multiple of PAPER_ALIGN so writing stays on the same lines.
+export type Paper = "none" | "dots" | "grid" | "lines";
+export const PAPER_SPACING: Record<Exclude<Paper, "none">, number> = { dots: 24, grid: 24, lines: 32 };
+export const PAPER_ALIGN = 96;
+export const PAPER_COLOR = "#d0d4da";
+
+/** Stroke pattern of a shape or line. Missing means solid. */
+export type DashStyle = "solid" | "dashed" | "dotted";
+
+// Inserted images are downscaled so their longest side is at most this many
+// px (they're stored inside the drawing's SVG), and placed no larger than
+// this fraction of the visible canvas.
+export const IMAGE_MAX_PX = 1600;
+export const IMAGE_VIEW_FRACTION = 0.6;
 
 // Saved/embedded files are cropped to the bounding box of the strokes, plus
 // this much breathing room on each side.

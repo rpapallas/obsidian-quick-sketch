@@ -33,6 +33,42 @@ const LUCIDE_24: Record<string, string> = {
 		<path d="M10 10.5V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2v8" />
 		<path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15" />
 	`,
+	"quick-sketch-laser": `
+		<path d="m3 21 6-6" stroke-width="3.5" />
+		<path d="m11.5 12.5 2-2" stroke-dasharray="0.5 2.5" />
+		<circle cx="17" cy="7" r="2.2" fill="currentColor" />
+		<path d="M17 2v1.2" />
+		<path d="M22 7h-1.2" />
+		<path d="M20.5 3.5l-.9.9" />
+		<path d="M20.5 10.5l-.9-.9" />
+		<path d="M13.5 3.5l.9.9" />
+	`,
+	"quick-sketch-present": `
+		<path d="M2 3h20" />
+		<path d="M21 3v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V3" />
+		<path d="m7 21 5-5 5 5" />
+	`,
+	"quick-sketch-close": `
+		<path d="M18 6 6 18" />
+		<path d="m6 6 12 12" />
+	`,
+	"quick-sketch-image-plus": `
+		<path d="M16 5h6" />
+		<path d="M19 2v6" />
+		<path d="M21 11.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7.5" />
+		<path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
+		<circle cx="9" cy="9" r="2" />
+	`,
+	"quick-sketch-paper": `
+		<rect width="18" height="18" x="3" y="3" rx="2" />
+		<path d="M3 9h18" />
+		<path d="M3 15h18" />
+		<path d="M9 3v18" />
+		<path d="M15 3v18" />
+	`,
+	"quick-sketch-chevron-down": `
+		<path d="m6 9 6 6 6-6" />
+	`,
 	"quick-sketch-undo": `
 		<path d="M9 14 L 4 9 l 5-5" />
 		<path d="M4 9 h 10.5 a 5.5 5.5 0 0 1 5.5 5.5 a 5.5 5.5 0 0 1-5.5 5.5 H 11" />
@@ -168,6 +204,12 @@ export const ICON = {
 	eraser: "quick-sketch-eraser",
 	select: "quick-sketch-select",
 	hand: "quick-sketch-hand",
+	laser: "quick-sketch-laser",
+	chevronDown: "quick-sketch-chevron-down",
+	present: "quick-sketch-present",
+	close: "quick-sketch-close",
+	imagePlus: "quick-sketch-image-plus",
+	paper: "quick-sketch-paper",
 	undo: "quick-sketch-undo",
 	redo: "quick-sketch-redo",
 	zoomIn: "quick-sketch-zoom-in",

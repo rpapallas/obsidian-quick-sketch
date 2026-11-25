@@ -1,5 +1,5 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
-import { COLORS, DEFAULT_COLOR, DEFAULT_STROKE_PX, STROKE_SIZES, Tool } from "./constants";
+import { COLORS, DEFAULT_COLOR, DEFAULT_STROKE_PX, LASER_COLORS, LaserTrail, Paper, STROKE_SIZES, Tool } from "./constants";
 import type QuickSketchPlugin from "./main";
 
 export interface QuickSketchSettings {
@@ -18,6 +18,15 @@ export interface QuickSketchSettings {
 	pressure: boolean;
 	pngScale: number;
 	pngBackground: "white" | "transparent";
+	/** Snap a pen stroke to a shape when the pen is held still at its end. */
+	shapeRecognition: boolean;
+	/** Background paper of new drawings. */
+	defaultPaper: Paper;
+	/** Save the background paper into the drawing file (so embeds and
+	 * exports show it), not just show it while editing. */
+	paperInExport: boolean;
+	laserColor: string;
+	laserTrail: LaserTrail;
 }
 
 export const DEFAULT_SETTINGS: QuickSketchSettings = {
@@ -31,6 +40,11 @@ export const DEFAULT_SETTINGS: QuickSketchSettings = {
 	pressure: true,
 	pngScale: 2,
 	pngBackground: "white",
+	shapeRecognition: true,
+	defaultPaper: "none",
+	paperInExport: false,
+	laserColor: LASER_COLORS[0],
+	laserTrail: "short",
 };
 
 const TOOL_NAMES: Partial<Record<Tool, string>> = {
@@ -140,7 +154,45 @@ export class QuickSketchSettingTab extends PluginSettingTab {
 				})
 			);
 
-		new Setting(containerEl).setName("PNG export").setHeading();
+		new Setting(containerEl)
+			.setName("Shape recognition")
+			.setDesc("Hold the pen still at the end of a stroke to snap it to a line, rectangle, ellipse or diamond.")
+			.addToggle((t) =>
+				t.setValue(s.shapeRecognition).onChange((v) => {
+					s.shapeRecognition = v;
+					save();
+				})
+			);
+
+		new Setting(containerEl).setName("Background").setHeading();
+
+		new Setting(containerEl)
+			.setName("Paper for new drawings")
+			.setDesc("Change it for a single drawing from its ⋯ menu.")
+			.addDropdown((d) =>
+				d
+					.addOption("none", "Plain")
+					.addOption("dots", "Dots")
+					.addOption("grid", "Grid")
+					.addOption("lines", "Lines")
+					.setValue(s.defaultPaper)
+					.onChange((v) => {
+						s.defaultPaper = v as Paper;
+						save();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Save paper with the drawing")
+			.setDesc("Show the dots/grid/lines in embedded drawings and exports too, not only while editing.")
+			.addToggle((t) =>
+				t.setValue(s.paperInExport).onChange((v) => {
+					s.paperInExport = v;
+					save();
+				})
+			);
+
+		new Setting(containerEl).setName("Export").setHeading();
 
 		new Setting(containerEl).setName("Resolution").addDropdown((d) =>
 			d
@@ -154,7 +206,7 @@ export class QuickSketchSettingTab extends PluginSettingTab {
 				})
 		);
 
-		new Setting(containerEl).setName("Background").addDropdown((d) =>
+		new Setting(containerEl).setName("PNG/PDF background").addDropdown((d) =>
 			d
 				.addOption("white", "White")
 				.addOption("transparent", "Transparent")
