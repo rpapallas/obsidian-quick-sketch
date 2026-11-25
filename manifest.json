@@ -2,8 +2,9 @@
 	"id": "quick-sketch",
 	"name": "Quick Sketch",
 	"version": "0.1.0",
-	"minAppVersion": "0.15.0",
-	"description": "Draw quick freehand sketches, embedded and editable inline in your notes.",
+	"minAppVersion": "1.7.2",
+	"description": "Sketch, diagram and present right inside your notes, with Apple Pencil support, shapes and arrows, a laser pointer, and PNG, SVG and PDF export.",
 	"author": "Rafael Papallas",
+	"authorUrl": "https://github.com/rpapallas",
 	"isDesktopOnly": false
 }

@@ -100,12 +100,6 @@ export default class QuickSketchPlugin extends Plugin {
 		);
 	}
 
-	onunload(): void {
-		for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_DRAWING)) {
-			leaf.detach();
-		}
-	}
-
 	async loadSettings(): Promise<void> {
 		const loaded = (await this.loadData()) as Partial<QuickSketchSettings> | null;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded ?? {});
@@ -181,10 +175,7 @@ export default class QuickSketchPlugin extends Plugin {
 		const content = await this.app.vault.read(file);
 		const dataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(content)}`;
 		this.freshSvgs.set(file.path, dataUrl);
-		const apply = () => {
-			const n = this.applySvgToEmbeds(file, dataUrl);
-			console.debug(`[quick-sketch] refreshed ${n} embed(s) of ${file.path}`);
-		};
+		const apply = () => this.applySvgToEmbeds(file, dataUrl);
 		apply();
 		window.setTimeout(apply, 300);
 		window.setTimeout(apply, 1000);

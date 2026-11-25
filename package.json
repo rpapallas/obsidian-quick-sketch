@@ -1,7 +1,7 @@
 {
 	"name": "quick-sketch",
 	"version": "0.1.0",
-	"description": "Draw quick freehand sketches, embedded and editable inline in your notes.",
+	"description": "Sketch, diagram and present right inside your notes, with Apple Pencil support, shapes and arrows, a laser pointer, and PNG, SVG and PDF export.",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
@@ -14,5 +14,6 @@
 		"esbuild": "0.19.11",
 		"obsidian": "latest",
 		"typescript": "5.3.3"
-	}
+	},
+	"author": "Rafael Papallas"
 }

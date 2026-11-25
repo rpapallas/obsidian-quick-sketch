@@ -718,9 +718,15 @@ function isClosedShape(e: DrawnElement): e is ShapeElement {
 	return e.kind === "rectangle" || e.kind === "ellipse" || e.kind === "diamond" || e.kind === "triangle";
 }
 
-/** Toolbar glyphs drawn from numbers only (safe for innerHTML). */
+/** Parses SVG markup we wrote ourselves (static, built from numbers only)
+ * into an element -- without innerHTML. The markup needs its xmlns. */
+function parseSvg(markup: string): Element {
+	return document.importNode(new DOMParser().parseFromString(markup, "image/svg+xml").documentElement, true);
+}
+
+/** Toolbar glyphs (see parseSvg). */
 function glyph(inner: string): string {
-	return `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`;
+	return `<svg xmlns="${SVG_NS}" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`;
 }
 function lineIcon(width: number): string {
 	return glyph(`<line x1="5" y1="12" x2="19" y2="12" stroke-width="${width}"/>`);
@@ -1446,7 +1452,7 @@ export class DrawingView extends ItemView {
 	private optionButton(parent: HTMLElement, label: string, svg: string, onClick: () => void): HTMLButtonElement {
 		const b = parent.createEl("button", { cls: "quick-sketch-btn qs-opt-btn", attr: { "aria-label": label, title: label } });
 		// Static markup built from numbers only (see lineIcon etc.).
-		b.innerHTML = svg;
+		b.appendChild(parseSvg(svg));
 		b.onclick = (evt) => {
 			evt.preventDefault();
 			onClick();
@@ -2547,7 +2553,7 @@ export class DrawingView extends ItemView {
 	}
 
 	private renderSelectionOverlay(): void {
-		this.overlayGroup.innerHTML = "";
+		this.overlayGroup.replaceChildren();
 		this.handles = [];
 		const z = this.zoom;
 		const add = (tag: string, attrs: Record<string, string | number>, cls: string): SVGElement => {
@@ -3202,7 +3208,7 @@ export class DrawingView extends ItemView {
 	}
 
 	private restoreElements(snapshot: SerializedElement[]): void {
-		this.elementsGroup.innerHTML = "";
+		this.elementsGroup.replaceChildren();
 		this.elements = snapshot.map((s) => this.createFromSerialized(s));
 	}
 
@@ -3235,7 +3241,7 @@ export class DrawingView extends ItemView {
 			"Clear the whole drawing?",
 			() => {
 				this.pushUndoSnapshot();
-				this.elementsGroup.innerHTML = "";
+				this.elementsGroup.replaceChildren();
 				this.elements = [];
 				this.selectedIds.clear();
 				this.renderSelectionOverlay();
@@ -3488,7 +3494,7 @@ export class DrawingView extends ItemView {
 		exportSvg.setAttribute("viewBox", `${fmt(x)} ${fmt(y)} ${fmt(width)} ${fmt(height)}`);
 		exportSvg.setAttribute("width", String(Math.round(width)));
 		exportSvg.setAttribute("height", String(Math.round(height)));
-		exportSvg.innerHTML = this.elementsGroup.innerHTML;
+		for (const node of Array.from(this.elementsGroup.childNodes)) exportSvg.appendChild(node.cloneNode(true));
 		if (!clean) exportSvg.setAttribute("data-paper", this.paper);
 		// Element ids are only needed by arrows attached to them.
 		const referenced = new Set<string>();
@@ -3522,7 +3528,7 @@ export class DrawingView extends ItemView {
 			bg.setAttribute("height", fmt(height));
 			bg.setAttribute("fill", "url(#qs-paper)");
 			const defs = document.createElementNS(SVG_NS, "defs");
-			defs.innerHTML = paperPattern(this.paper);
+			defs.appendChild(parseSvg(`<svg xmlns="${SVG_NS}">${paperPattern(this.paper)}</svg>`).firstElementChild as Element);
 			exportSvg.prepend(defs, bg);
 		}
 
@@ -3945,8 +3951,8 @@ export class DrawingView extends ItemView {
 		this.selectedIds.clear();
 		this.selectionBox = null;
 		this.selectionDrag = null;
-		this.elementsGroup.innerHTML = "";
-		if (this.overlayGroup) this.overlayGroup.innerHTML = "";
+		this.elementsGroup.replaceChildren();
+		if (this.overlayGroup) this.overlayGroup.replaceChildren();
 		this.elements = [];
 
 		let root: Element | null = null;
