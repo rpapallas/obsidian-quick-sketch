@@ -1,0 +1,635 @@
+.quick-sketch-view {
+	position: relative;
+	height: 100%;
+	padding: 0 !important;
+	overflow: hidden;
+}
+
+/* --- Floating controls ------------------------------------------------ */
+
+.qs-island {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	padding: 4px;
+	border-radius: 12px;
+	background-color: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+	pointer-events: auto;
+}
+
+/* Tools centered at the top, history/menu/Done on the right. The bar
+   itself lets presses through to the canvas between the islands. */
+.qs-topbar {
+	position: absolute;
+	top: 10px;
+	left: 10px;
+	right: 10px;
+	z-index: 30;
+	display: flex;
+	align-items: flex-start;
+	gap: 8px;
+	pointer-events: none;
+}
+
+.qs-topbar-spacer,
+.qs-topbar-right {
+	flex: 1 1 0;
+	min-width: 0;
+	display: flex;
+}
+
+.qs-topbar-right {
+	justify-content: flex-end;
+}
+
+.qs-topbar-center {
+	flex: 0 1 auto;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 8px;
+	pointer-events: none;
+}
+
+.qs-tools {
+	flex: 0 0 auto;
+}
+
+/* Narrow panes: tools on the left, actions wrap below if needed. */
+@media (max-width: 640px) {
+	.qs-topbar {
+		flex-wrap: wrap;
+	}
+	.qs-topbar-spacer {
+		display: none;
+	}
+}
+
+.qs-sep {
+	width: 1px;
+	height: 20px;
+	margin: 0 4px;
+	background-color: var(--background-modifier-border);
+}
+
+.qs-done {
+	margin-left: 6px;
+	height: 32px;
+	border-radius: 8px;
+}
+
+/* The current tool's options: one column at the right, under the
+   actions. Its place and max height are set in code (placeDock), since it
+   can be dragged by the grip at the top. */
+.qs-style-panel {
+	position: absolute;
+	top: 58px;
+	right: 10px;
+	/* Always as wide as its column, wherever it's dragged -- near an edge an
+	   absolutely-positioned box would otherwise shrink to fit. */
+	width: max-content;
+	z-index: 30;
+	flex-direction: column;
+	align-items: stretch;
+	gap: 0;
+	padding: 2px 4px 6px;
+}
+
+.qs-style-panel.is-dragging {
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+	opacity: 0.95;
+}
+
+.qs-grip {
+	display: flex;
+	justify-content: center;
+	padding: 2px 0;
+	color: var(--text-faint);
+	cursor: grab;
+	touch-action: none;
+}
+
+.qs-grip:hover {
+	color: var(--text-muted);
+}
+
+.qs-style-panel.is-dragging .qs-grip {
+	cursor: grabbing;
+}
+
+.qs-grip svg {
+	width: 18px;
+	height: 18px;
+}
+
+/* Scrolls when the options don't fit below the panel's top. */
+.qs-style-body {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+	scrollbar-width: none;
+}
+
+.qs-style-body::-webkit-scrollbar {
+	display: none;
+}
+
+.qs-section {
+	padding: 6px 0;
+}
+
+.qs-section + .qs-section {
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.qs-section-body {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 4px;
+}
+
+.qs-section-body.qs-swatches {
+	gap: 6px;
+}
+
+.qs-zoom {
+	position: absolute;
+	left: 10px;
+	bottom: 10px;
+	z-index: 30;
+}
+
+.qs-zoom-label {
+	min-width: 52px;
+	height: 32px;
+	padding: 0 6px !important;
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+	background: transparent !important;
+	box-shadow: none !important;
+	border-radius: 8px;
+	cursor: pointer;
+}
+
+.quick-sketch-btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box !important;
+	width: 32px !important;
+	height: 32px !important;
+	min-width: 32px !important;
+	min-height: 32px !important;
+	/* !important: Obsidian's mobile button padding otherwise wins, and with
+	   border-box a box can't be narrower than its padding -- stretching it. */
+	padding: 0 !important;
+	border: none;
+	border-radius: 8px;
+	background: transparent;
+	box-shadow: none;
+	color: var(--text-normal);
+	cursor: pointer;
+}
+
+/* Scoped to the view (and the element type) to outrank Obsidian's own
+   button:not(.clickable-icon) background and shadow. */
+.quick-sketch-view button.quick-sketch-btn {
+	background-color: transparent;
+	box-shadow: none;
+	border: none;
+}
+
+.quick-sketch-view button.quick-sketch-btn:hover {
+	background-color: var(--background-modifier-hover);
+}
+
+.quick-sketch-view button.quick-sketch-btn.is-active {
+	background-color: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+.quick-sketch-btn svg {
+	width: 18px;
+	height: 18px;
+	flex: 0 0 auto;
+}
+
+.quick-sketch-btn.is-active {
+	background-color: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+/* A grouped tool (select/lasso, shapes): the tool plus a chevron button
+   listing its variants, joined into one pill. */
+.qs-split {
+	display: inline-flex;
+	align-items: center;
+	border-radius: 8px;
+}
+
+.qs-split.is-active {
+	background-color: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+.quick-sketch-view .qs-split.is-active button.quick-sketch-btn.is-active {
+	background-color: transparent;
+}
+
+.quick-sketch-view button.qs-split-more {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box !important;
+	width: 16px !important;
+	min-width: 16px !important;
+	height: 32px !important;
+	min-height: 32px !important;
+	margin-left: -2px;
+	padding: 0 !important;
+	border: none;
+	border-radius: 0 8px 8px 0;
+	background: transparent;
+	box-shadow: none;
+	color: inherit;
+	opacity: 0.7;
+	cursor: pointer;
+}
+
+.quick-sketch-view button.qs-split-more:hover {
+	opacity: 1;
+	background-color: var(--background-modifier-hover);
+}
+
+.qs-split-more svg {
+	width: 12px;
+	height: 12px;
+}
+
+.quick-sketch-swatch {
+	/* The visible circle is drawn by ::before at a fixed pixel size, not by
+	   the button box itself: on iPad, Obsidian's mobile button styles still
+	   reshape the box (appearance, padding, min sizes) and border-radius: 50%
+	   on a non-square box is an oval. A pseudo-element isn't targeted by those
+	   styles, so it stays a true circle whatever happens to the box. */
+	position: relative;
+	display: inline-block;
+	flex: 0 0 auto;
+	box-sizing: border-box !important;
+	width: 26px !important;
+	height: 26px !important;
+	min-width: 26px !important;
+	min-height: 26px !important;
+	max-width: 26px !important;
+	max-height: 26px !important;
+	margin: 0;
+	padding: 0 !important;
+	border: none !important;
+	background: transparent !important;
+	box-shadow: none !important;
+	-webkit-appearance: none;
+	appearance: none;
+	cursor: pointer;
+}
+
+.quick-sketch-swatch::before {
+	content: "";
+	position: absolute;
+	top: 50%;
+	left: 50%;
+	width: 22px;
+	height: 22px;
+	transform: translate(-50%, -50%);
+	box-sizing: border-box;
+	border-radius: 50%;
+	border: 2px solid var(--background-modifier-border);
+	background-color: var(--qs-swatch-color, transparent);
+	pointer-events: none;
+}
+
+.quick-sketch-swatch.is-active::before {
+	border-color: var(--background-primary);
+	box-shadow: 0 0 0 2px var(--interactive-accent);
+}
+
+.quick-sketch-swatch-add {
+	position: relative;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	font-size: 14px;
+	line-height: 1;
+	color: var(--text-muted);
+	overflow: hidden;
+}
+
+/* The "+" swatch's color input: invisible, but stretched over the whole
+   swatch so a tap reaches it (the swatch clips its overflow). */
+.quick-sketch-swatch-add > input[type="color"] {
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 100%;
+	height: 100%;
+	opacity: 0;
+	cursor: inherit;
+}
+
+.quick-sketch-canvas-wrap {
+	position: absolute;
+	inset: 0;
+	overflow: hidden;
+	/* Stop WebKit/iPadOS from treating a pencil touch-and-hold as the start of
+	   a text-selection/long-press gesture -- that recognizer competing with
+	   our own pointer handling is what shows up as a delay before a quick
+	   re-touch (e.g. lifting the pencil after the stem of an "i" and tapping
+	   again for the dot) gets delivered as a new pointerdown. */
+	-webkit-touch-callout: none;
+	-webkit-user-select: none;
+	user-select: none;
+	-webkit-tap-highlight-color: transparent;
+	/* The listeners live on this wrapper, so it needs touch-action too --
+	   otherwise WebKit's double-tap-zoom delay can still apply to contacts
+	   that land on it (e.g. when zoomed out past the canvas edge). */
+	touch-action: none;
+}
+
+.quick-sketch-canvas {
+	display: block;
+	/* Pan/zoom is handled entirely in JS (pointer + wheel), for both touch and
+	   pen/mouse -- touch-action: none stops the browser from ever hijacking a
+	   stylus contact as its own pan/zoom gesture. */
+	touch-action: none;
+	background-color: #ffffff;
+}
+
+.quick-sketch-canvas-wrap.tool-pencil .quick-sketch-canvas,
+.quick-sketch-canvas-wrap.tool-highlighter .quick-sketch-canvas {
+	cursor: crosshair;
+}
+
+.quick-sketch-canvas-wrap.tool-eraser .quick-sketch-canvas {
+	cursor: cell;
+}
+
+.quick-sketch-canvas-wrap.tool-select .quick-sketch-canvas {
+	cursor: default;
+}
+
+.quick-sketch-canvas-wrap.tool-lasso .quick-sketch-canvas {
+	cursor: crosshair;
+}
+
+.quick-sketch-canvas-wrap.tool-pan .quick-sketch-canvas {
+	cursor: grab;
+}
+
+.quick-sketch-canvas-wrap.tool-rectangle .quick-sketch-canvas,
+.quick-sketch-canvas-wrap.tool-ellipse .quick-sketch-canvas,
+.quick-sketch-canvas-wrap.tool-diamond .quick-sketch-canvas,
+.quick-sketch-canvas-wrap.tool-line .quick-sketch-canvas,
+.quick-sketch-canvas-wrap.tool-arrow .quick-sketch-canvas {
+	cursor: crosshair;
+}
+
+.quick-sketch-canvas-wrap.tool-text .quick-sketch-canvas {
+	cursor: text;
+}
+
+/* The laser dot replaces the cursor. */
+.quick-sketch-canvas-wrap.tool-laser .quick-sketch-canvas {
+	cursor: none;
+}
+
+/* Background paper (see PAPER_SPACING / PAPER_COLOR in constants.ts). It
+   is a background of the canvas itself, so it pans and zooms with it. */
+.quick-sketch-canvas.qs-paper-dots {
+	background-image: radial-gradient(circle at 12px 12px, #d0d4da 1.3px, transparent 1.6px);
+	background-size: 24px 24px;
+}
+
+.quick-sketch-canvas.qs-paper-grid {
+	background-image: linear-gradient(to right, #d0d4da 1px, transparent 1px), linear-gradient(to bottom, #d0d4da 1px, transparent 1px);
+	background-size: 24px 24px;
+}
+
+.quick-sketch-canvas.qs-paper-lines {
+	background-image: linear-gradient(to bottom, #d0d4da 1px, transparent 1px);
+	background-size: 32px 32px;
+}
+
+/* Presentation mode: only the drawing (and a faint exit button). */
+.quick-sketch-view.qs-presenting .qs-topbar,
+.quick-sketch-view.qs-presenting .qs-style-panel,
+.quick-sketch-view.qs-presenting .qs-zoom {
+	display: none !important;
+}
+
+.quick-sketch-view:fullscreen {
+	background-color: var(--background-primary);
+}
+
+.qs-present-exit {
+	position: absolute;
+	right: 14px;
+	bottom: 14px;
+	z-index: 30;
+	width: 36px;
+	height: 36px;
+	padding: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: 50%;
+	opacity: 0.35;
+	transition: opacity 0.15s;
+}
+
+.qs-present-exit:hover {
+	opacity: 1;
+}
+
+/* Hidden but still "in the page", so iOS will open its picker. */
+.qs-image-input {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	opacity: 0;
+	pointer-events: none;
+}
+
+/* Screen-space overlay for the laser pointer, above the (transformed) svg. */
+.qs-laser-canvas {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	pointer-events: none;
+	z-index: 5;
+}
+
+.quick-sketch-overlay {
+	pointer-events: none;
+}
+
+.quick-sketch-text-input {
+	position: absolute;
+	z-index: 20;
+	min-width: 60px;
+	min-height: 1.4em;
+	padding: 2px 4px;
+	margin: 0;
+	box-sizing: border-box;
+	border: 1px dashed var(--interactive-accent);
+	border-radius: 2px;
+	background-color: color-mix(in srgb, var(--background-primary) 75%, transparent);
+	font-family: sans-serif;
+	line-height: 1.2;
+	resize: none;
+	overflow: hidden;
+	outline: none;
+}
+
+/* Label editor for a shape: centered on the shape, or sitting above an
+ * arrow's midpoint. */
+.quick-sketch-text-input.quick-sketch-label-input {
+	transform: translate(-50%, -50%);
+	text-align: center;
+}
+
+.quick-sketch-text-input.quick-sketch-label-input.is-arrow {
+	transform: translate(-50%, -100%);
+}
+
+.quick-sketch-selection-rect {
+	fill: none;
+	stroke: var(--interactive-accent);
+	stroke-width: 1;
+	stroke-dasharray: 4 4;
+	vector-effect: non-scaling-stroke;
+}
+
+.quick-sketch-rubberband {
+	fill: color-mix(in srgb, var(--interactive-accent) 15%, transparent);
+	stroke: var(--interactive-accent);
+	stroke-width: 1;
+	stroke-dasharray: 4 4;
+	vector-effect: non-scaling-stroke;
+}
+
+/* Bounding box of the whole selection, its resize handles, and the
+   outline of a shape an arrow end is about to attach to. */
+.qs-selection-box {
+	fill: none;
+	stroke: var(--interactive-accent);
+	stroke-width: 1;
+	vector-effect: non-scaling-stroke;
+}
+
+.qs-handle {
+	fill: #ffffff;
+	stroke: var(--interactive-accent);
+	stroke-width: 1.5;
+	vector-effect: non-scaling-stroke;
+}
+
+.qs-bind-highlight {
+	fill: color-mix(in srgb, var(--interactive-accent) 10%, transparent);
+	stroke: var(--interactive-accent);
+	stroke-width: 2;
+	vector-effect: non-scaling-stroke;
+}
+
+.quick-sketch-embed {
+	/* display must be set explicitly: this class lands on an inline
+	   <span> (Obsidian's .internal-embed), and an inline element as the
+	   containing block for an absolutely-positioned child is inconsistent
+	   across engines -- WebKit/iPadOS in particular can resolve it against
+	   the wrong fragment box, which is what put the edit button at the
+	   bottom-right instead of the top-right. */
+	display: inline-block;
+	position: relative;
+	line-height: 0;
+}
+
+/* The "Edit" button on drawings embedded in notes: a small island like
+   the editor's toolbars. Scoped to the embed and the element type, with
+   !important on sizing, to outrank Obsidian's own button styles (and its
+   larger mobile padding/height). */
+.quick-sketch-embed button.quick-sketch-edit-btn {
+	position: absolute;
+	top: 8px;
+	right: 8px;
+	z-index: 2;
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	box-sizing: border-box !important;
+	height: 30px !important;
+	min-height: 30px !important;
+	width: auto !important;
+	margin: 0;
+	padding: 0 10px 0 8px !important;
+	border: 1px solid var(--background-modifier-border) !important;
+	border-radius: 10px;
+	background-color: var(--background-primary) !important;
+	box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12) !important;
+	color: var(--text-normal);
+	font-family: var(--font-interface);
+	font-size: 12px;
+	font-weight: 500;
+	line-height: 1;
+	-webkit-appearance: none;
+	appearance: none;
+	cursor: pointer;
+	transition: opacity 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+
+.quick-sketch-embed button.quick-sketch-edit-btn:hover {
+	background-color: var(--interactive-accent) !important;
+	border-color: var(--interactive-accent) !important;
+	color: var(--text-on-accent);
+}
+
+.quick-sketch-edit-icon {
+	display: inline-flex;
+}
+
+.quick-sketch-edit-icon svg {
+	width: 15px;
+	height: 15px;
+}
+
+/* On desktop it appears while the drawing is hovered (or the button has
+   keyboard focus). In the iPhone/iPad app (.is-mobile) it's always shown,
+   even with a trackpad attached: touch and the pencil can't hover. */
+@media (hover: hover) {
+	body:not(.is-mobile) .quick-sketch-embed button.quick-sketch-edit-btn {
+		opacity: 0;
+	}
+	body:not(.is-mobile) .quick-sketch-embed:hover button.quick-sketch-edit-btn,
+	body:not(.is-mobile) .quick-sketch-embed button.quick-sketch-edit-btn:focus-visible {
+		opacity: 1;
+	}
+}
+
+.quick-sketch-diag {
+	position: absolute;
+	right: 10px;
+	bottom: 10px;
+	z-index: 10;
+	pointer-events: none;
+	white-space: pre;
+	font-family: var(--font-monospace);
+	font-size: 11px;
+	line-height: 1.35;
+	padding: 6px 8px;
+	border-radius: 6px;
+	background: rgba(0, 0, 0, 0.72);
+	color: #fff;
+}

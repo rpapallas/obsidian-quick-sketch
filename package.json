@@ -1,0 +1,19 @@
+{
+	"name": "quick-sketch",
+	"version": "1.0.0",
+	"description": "Sketch, diagram and present right inside your notes, with Apple Pencil support, shapes and arrows, a laser pointer, and PNG, SVG and PDF export.",
+	"main": "main.js",
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+	},
+	"license": "MIT",
+	"devDependencies": {
+		"@types/node": "^20.11.5",
+		"builtin-modules": "3.3.0",
+		"esbuild": "^0.28.2",
+		"obsidian": "^1.14.4",
+		"typescript": "5.3.3"
+	},
+	"author": "Rafael Papallas"
+}

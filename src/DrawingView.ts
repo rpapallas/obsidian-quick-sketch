@@ -1,0 +1,4452 @@
+import { ItemView, Menu, Notice, Platform, TFile, ViewStateResult, WorkspaceLeaf, normalizePath, setIcon } from "obsidian";
+import {
+	ArrowHeads,
+	BIND_DISTANCE_PX,
+	CLOSED_SHAPE_TOOLS,
+	COLORS,
+	CROP_PADDING,
+	DEFAULT_COLOR,
+	DEFAULT_STROKE_PX,
+	DEFAULT_TOOL,
+	DashStyle,
+	DOUBLE_TAP_MS,
+	EMPTY_EXPORT_HEIGHT,
+	EMPTY_EXPORT_WIDTH,
+	EMPTY_SVG,
+	ERASE_RADIUS_PX,
+	FillStyle,
+	HANDLE_HIT_PX,
+	HANDLE_SIZE_PX,
+	HIGHLIGHT_COLORS,
+	INK,
+	HIGHLIGHT_OPACITY,
+	HIGHLIGHT_SIZE_MULTIPLIER,
+	IMAGE_MAX_PX,
+	IMAGE_VIEW_FRACTION,
+	LASER_COLORS,
+	LASER_HOLD_FADE_MS,
+	LASER_TRAIL_MS,
+	LASER_WIDTH_PX,
+	LaserTrail,
+	MAX_ZOOM,
+	LIGHT_FILL_OPACITY,
+	MIN_ZOOM,
+	NUDGE_BIG_PX,
+	NUDGE_PX,
+	PAPER_ALIGN,
+	PAPER_COLOR,
+	PAPER_SPACING,
+	PASTE_OFFSET,
+	Paper,
+	RECOGNIZE_HOLD_MS,
+	RECOGNIZE_HOLD_TOLERANCE_PX,
+	RECOGNIZE_MIN_SIZE_PX,
+	SELECT_HIT_RADIUS_PX,
+	SELECT_TOOLS,
+	SHAPE_TOOLS,
+	STROKE_SIZES,
+	TEXT_SIZE_MULTIPLIER,
+	Tool,
+	VIEW_TYPE_DRAWING,
+	WORKSPACE_CENTER,
+	WORKSPACE_SIZE,
+	SIMPLIFY_TOLERANCE,
+} from "./constants";
+import { askToConfirm } from "./dialog";
+import { canvasToPdf, copyPngToClipboard, svgToCanvas, svgToPng } from "./export";
+import { decodePressure, encodePressure, pressureOutline } from "./freehand";
+import { Box, boxAround, boxHas, boxesTouch, grow, segmentDistance } from "./geometry";
+import { History } from "./history";
+import { ICON } from "./icons";
+import type QuickSketchPlugin from "./main";
+import { recognizeShape } from "./recognize";
+import { saveExport } from "./save";
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+// Autosave waits for a real pause: a save (serializing the SVG, writing the
+// file -- possibly to iCloud -- and refreshing embeds in open notes) is main-
+// thread work, and with a short debounce it lands in the natural gaps between
+// words while handwriting, delaying the next stroke's ink.
+const SAVE_DEBOUNCE_MS = 2000;
+
+// Palm rejection: while handwriting, the resting hand reaches us as ordinary
+// "touch" pointers, which would otherwise pan (one contact) or pinch-zoom
+// (two) the canvas between strokes -- and a zoom change makes WebKit
+// re-rasterize the whole huge SVG, stalling the next stroke's ink. Touches
+// are ignored while the pen is down and for this long after it was last used.
+const PALM_GUARD_MS = 1500;
+
+/** Input-latency counters shown by the "Toggle input diagnostics" command. */
+interface InputDiagnostics {
+	el: HTMLElement;
+	penDowns: number;
+	lastDeliveryMs: number;
+	maxDeliveryMs: number;
+	lastLiftGapMs: number;
+	lastDownToMoveMs: number;
+	awaitingFirstMove: number | null;
+	maxDownHandlerMs: number;
+	maxUpHandlerMs: number;
+	longFrames: number;
+	maxFrameMs: number;
+	lastFrameAt: number;
+	rafId: number;
+	touchesAccepted: number;
+	touchesRejected: number;
+	missedPointerUps: number;
+	lastSaveMs: number;
+	lastPenUpAt: number;
+}
+
+interface Point {
+	x: number;
+	y: number;
+	/** Pen pressure (0..1), only on points of pressure strokes. */
+	p?: number;
+}
+
+/** "triangle" is no longer drawable (the toolbar offers a diamond instead)
+ * but is kept so triangles in older files still load and render. */
+/** An "image" is a pasted/inserted picture, handled as a box like the shapes. */
+type ShapeKind = "rectangle" | "ellipse" | "diamond" | "triangle" | "arrow" | "image";
+type ElementKind = "freehand" | ShapeKind | "text";
+
+interface FreehandElement {
+	id: string;
+	kind: "freehand";
+	el: SVGPathElement;
+	color: string;
+	size: number;
+	points: Point[];
+	highlight?: boolean;
+	/** Points carry pen pressure; rendered as a filled variable-width outline. */
+	pressure?: boolean;
+}
+
+/** A shape's geometry and style -- everything but its id and live DOM. */
+interface ShapeData {
+	kind: ShapeKind;
+	color: string;
+	size: number;
+	x0: number;
+	y0: number;
+	x1: number;
+	y1: number;
+	label?: string;
+	labelSize?: number;
+	/** Closed shapes only; missing means "none". */
+	fill?: FillStyle;
+	/** Arrows only; missing means "end" (what older files have). A line is
+	 * an arrow with no heads. */
+	heads?: ArrowHeads;
+	/** Arrows only: ids of the elements the start/end is attached to. */
+	startBind?: string;
+	endBind?: string;
+	/** Closed shapes and arrows; missing means solid. */
+	dash?: DashStyle;
+	/** Images only: the picture, as a data: URL. */
+	href?: string;
+}
+
+interface ShapeElement {
+	id: string;
+	kind: ShapeKind;
+	el: SVGGraphicsElement;
+	color: string;
+	size: number;
+	x0: number;
+	y0: number;
+	x1: number;
+	y1: number;
+	fill?: FillStyle;
+	heads?: ArrowHeads;
+	startBind?: string;
+	endBind?: string;
+	dash?: DashStyle;
+	href?: string;
+	/** Optional text centered inside the shape (or above an arrow's line). */
+	label?: string;
+	labelSize?: number; // font size
+	labelEl?: SVGTextElement;
+	/** While labeled, the <g data-kind="labeled"> holding the shape and its
+	 * label, so they form one unit in the DOM and in the saved file. */
+	labelGroup?: SVGGElement;
+	/** Inputs of the last label fit, to skip re-wrapping when only moved. */
+	labelFitKey?: string;
+}
+
+interface TextElement {
+	id: string;
+	kind: "text";
+	el: SVGTextElement;
+	color: string;
+	size: number; // font size
+	x: number;
+	y: number;
+	text: string;
+}
+
+type DrawnElement = FreehandElement | ShapeElement | TextElement;
+
+type GeometrySnapshot =
+	| { kind: "freehand"; points: Point[] }
+	| { kind: "box"; x0: number; y0: number; x1: number; y1: number }
+	| { kind: "text"; x: number; y: number; size: number };
+
+/** Serialized form used for undo/redo snapshots -- geometry only, no live DOM refs. */
+type SerializedElement =
+	| { id: string; kind: "freehand"; color: string; size: number; points: Point[]; highlight?: boolean; pressure?: boolean }
+	| ({ id: string } & ShapeData)
+	| { id: string; kind: "text"; color: string; size: number; x: number; y: number; text: string };
+
+/** Elements copied with Cmd/Ctrl+C -- shared by all open drawings, so you
+ * can copy from one and paste into another. */
+let clipboard: SerializedElement[] = [];
+
+interface ActiveDrawStroke {
+	pathEl: SVGPathElement;
+	points: Point[];
+	pointerId: number;
+	color: string;
+	size: number;
+	highlight: boolean;
+	pressure: boolean;
+}
+
+interface ActiveShapeDraw {
+	kind: ShapeKind;
+	elem: ShapeElement;
+	pointerId: number;
+	/** Where the press started (before any snapping to a bound shape). */
+	start: Point;
+}
+
+interface PanDrag {
+	pointerId: number;
+	startWrap: Point;
+	startPanX: number;
+	startPanY: number;
+}
+
+interface SelectionDrag {
+	pointerId: number;
+	startCanvas: Point;
+	original: Map<string, GeometrySnapshot>;
+	snapshotTaken: boolean;
+	/** Set on the first move (a press alone doesn't move anything). */
+	moved?: boolean;
+}
+
+interface Marquee {
+	pointerId: number;
+	x0: number;
+	y0: number;
+	x1: number;
+	y1: number;
+	/** Shift held: add to the selection that existed before (`base`). */
+	base: string[];
+}
+
+interface Lasso {
+	pointerId: number;
+	points: Point[];
+	base: string[];
+}
+
+/** The eight box handles, and the two endpoint handles of a lone arrow. */
+type HandleId = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w" | "start" | "end";
+
+interface SelectionResize {
+	pointerId: number;
+	handle: HandleId;
+	box0: Rect;
+	original: Map<string, GeometrySnapshot>;
+	snapshotTaken: boolean;
+}
+
+interface EndpointDrag {
+	pointerId: number;
+	elem: ShapeElement;
+	end: "start" | "end";
+	snapshotTaken: boolean;
+}
+
+/** Which style panel sections apply to the current tool or selection. */
+interface StyleContext {
+	laser: boolean;
+	/** Color and size. */
+	stroke: boolean;
+	highlight: boolean;
+	fill: boolean;
+	heads: boolean;
+	dash: boolean;
+	actions: boolean;
+}
+
+/** A laser trail point, in wrapper (screen) coordinates. */
+interface LaserPoint {
+	x: number;
+	y: number;
+	t: number;
+}
+
+/** The laser pointer: a dot following the pointer (on hover too), and while
+ * pressed a trail that fades out behind it. Drawn on its own small screen-
+ * space <canvas>, never in the drawing -- nothing is saved or undoable, and
+ * the huge SVG never has to re-render. */
+interface LaserState {
+	canvas: HTMLCanvasElement;
+	ctx: CanvasRenderingContext2D;
+	/** Separate strokes; old points expire. `fadeFrom` is set when the whole
+	 * trail starts fading out (a "hold" trail once the next one begins). */
+	trails: { points: LaserPoint[]; fadeFrom: number | null }[];
+	/** Pointer currently drawing the newest trail, if pressed. */
+	pointerId: number | null;
+	/** Where the dot is drawn; null hides it (pointer left the canvas). */
+	dot: Point | null;
+	rafId: number | null;
+}
+
+const LABEL_LINE_HEIGHT = 1.2; // em
+const LABEL_MIN_FONT = 4;
+
+let measureCtx: CanvasRenderingContext2D | null = null;
+function measureText(text: string, fontSize: number): number {
+	if (!measureCtx) measureCtx = document.createElement("canvas").getContext("2d");
+	if (!measureCtx) return text.length * fontSize * 0.55;
+	measureCtx.font = `${fontSize}px sans-serif`;
+	return measureCtx.measureText(text).width;
+}
+
+/** Greedy word wrap of `text` (explicit newlines kept) to `maxWidth`. */
+function wrapText(text: string, fontSize: number, maxWidth: number): string[] {
+	const lines: string[] = [];
+	for (const para of text.split("\n")) {
+		let line = "";
+		for (const word of para.split(/\s+/).filter(Boolean)) {
+			const candidate = line ? `${line} ${word}` : word;
+			if (line && measureText(candidate, fontSize) > maxWidth) {
+				lines.push(line);
+				line = word;
+			} else {
+				line = candidate;
+			}
+		}
+		lines.push(line);
+	}
+	return lines;
+}
+
+/** Picks the largest font size, up to `baseSize`, at which `text` wraps to
+ * fit inside a `maxWidth` x `maxHeight` box, and returns the wrapped lines. */
+function fitLabel(text: string, baseSize: number, maxWidth: number, maxHeight: number): { lines: string[]; fontSize: number } {
+	let fontSize = baseSize;
+	for (;;) {
+		const lines = wrapText(text, fontSize, maxWidth);
+		const widest = Math.max(...lines.map((l) => measureText(l, fontSize)));
+		const height = lines.length * fontSize * LABEL_LINE_HEIGHT;
+		if ((widest <= maxWidth && height <= maxHeight) || fontSize <= LABEL_MIN_FONT) return { lines, fontSize };
+		fontSize = Math.max(LABEL_MIN_FONT, fontSize * 0.9);
+	}
+}
+
+/** Single-key shortcuts (no modifiers) for switching tools. */
+const KEY_TOOLS: Record<string, Tool> = {
+	p: "pencil",
+	h: "highlighter",
+	e: "eraser",
+	t: "text",
+	s: "rectangle",
+	c: "ellipse",
+	d: "diamond",
+	a: "arrow",
+	l: "line",
+	v: "select",
+	f: "lasso",
+	k: "laser",
+};
+
+/** Single-key shortcuts for the ink color. */
+const KEY_COLORS: Record<string, string> = { b: INK.black, r: INK.red, o: INK.orange, g: INK.green };
+
+/** A random id for a new element. Ids only need to be unique within one
+ * drawing (arrows refer to the shapes they're attached to by id). */
+/** Freehand points nearer than this to the previous one are skipped. */
+const MIN_POINT_GAP = Math.sqrt(1.5);
+
+function newElementId(): string {
+	return Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Rounds to 0.1 canvas units -- far below anything visible, and it keeps
+ * saved coordinates short instead of 17-digit floats from getScreenCTM(). */
+function round1(n: number): number {
+	return Math.round(n * 10) / 10;
+}
+
+/** Formats a number for an SVG attribute at 0.1 precision, without float
+ * noise like "12.299999999". */
+function fmt(n: number): string {
+	return String(round1(n));
+}
+
+/** Formats integer tenths compactly: 15 -> "1.5", 5 -> ".5", -5 -> "-.5". */
+function fmtTenths(n: number): string {
+	const s = (Math.abs(n) / 10).toString().replace(/^0\./, ".");
+	return n < 0 ? "-" + s : s;
+}
+
+/** Joins numbers the way SVG path data allows: a minus sign doubles as a
+ * separator, so a space is only needed before non-negative values. */
+function joinTenths(nums: number[]): string {
+	let out = "";
+	for (const n of nums) {
+		const v = fmtTenths(n);
+		if (out && v[0] !== "-") out += " ";
+		out += v;
+	}
+	return out;
+}
+
+/** Smooth path through `points` using quadratic segments whose control
+ * points are the raw input points and whose endpoints are the midpoints
+ * between them. Written with relative commands in integer tenths so the
+ * numbers stay short and exact (no rounding drift), and so the raw points
+ * can be recovered exactly from `d` by parseSmoothPath -- no separate copy of
+ * the point data needs saving. */
+function buildSmoothPath(points: Point[]): string {
+	const t = points.map((p) => ({ x: Math.round(p.x * 10), y: Math.round(p.y * 10) }));
+	let cx = t[0].x;
+	let cy = t[0].y;
+	let d = "M" + joinTenths([cx, cy]);
+	if (t.length === 1) return d + "l0 0";
+	for (let i = 1; i < t.length - 1; i++) {
+		const mx = Math.round((t[i].x + t[i + 1].x) / 2);
+		const my = Math.round((t[i].y + t[i + 1].y) / 2);
+		d += "q" + joinTenths([t[i].x - cx, t[i].y - cy, mx - cx, my - cy]);
+		cx = mx;
+		cy = my;
+	}
+	const last = t[t.length - 1];
+	return d + "l" + joinTenths([last.x - cx, last.y - cy]);
+}
+
+/** Inverse of buildSmoothPath: recovers the raw points from its compact
+ * relative `d`. Returns null for anything not in that exact format (legacy
+ * absolute paths, externally-edited files). */
+function parseSmoothPath(d: string): Point[] | null {
+	const m = /^M([^a-zA-Z]*)((?:q[^a-zA-Z]*)*)l([^a-zA-Z]*)$/.exec(d.trim());
+	if (!m) return null;
+	const nums = (str: string) => (str.match(/-?(?:\d+\.?\d*|\.\d+)/g) ?? []).map(Number);
+	const start = nums(m[1]);
+	const end = nums(m[3]);
+	if (start.length !== 2 || end.length !== 2) return null;
+	let cx = start[0];
+	let cy = start[1];
+	const points: Point[] = [{ x: cx, y: cy }];
+	for (const seg of m[2].split("q").slice(1)) {
+		const n = nums(seg);
+		if (n.length !== 4) return null;
+		points.push({ x: round1(cx + n[0]), y: round1(cy + n[1]) });
+		cx = round1(cx + n[2]);
+		cy = round1(cy + n[3]);
+	}
+	const last = { x: round1(cx + end[0]), y: round1(cy + end[1]) };
+	// A single dot is written as "M x y l0 0" -- don't double its point.
+	if (points.length > 1 || last.x !== points[0].x || last.y !== points[0].y) points.push(last);
+	return points;
+}
+
+/** Best-effort fallback for reading point data back out of a plain `d`
+ * string -- used only for externally-edited SVGs whose `d` isn't in the
+ * format buildSmoothPath writes (and that predate `data-points`). */
+function parseLegacyPathPoints(d: string): Point[] {
+	const nums = d.match(/-?\d+(\.\d+)?/g);
+	if (!nums) return [];
+	const points: Point[] = [];
+	for (let i = 0; i + 1 < nums.length; i += 2) {
+		points.push({ x: parseFloat(nums[i]), y: parseFloat(nums[i + 1]) });
+	}
+	return points;
+}
+
+/** Ramer-Douglas-Peucker: keeps only the points that deviate from the
+ * straight line between their neighbours by more than `tolerance`. Always
+ * keeps the endpoints. Iterative (explicit stack) so very long strokes
+ * can't blow the call stack. */
+function simplifyPoints(points: Point[], tolerance: number): Point[] {
+	if (points.length < 3) return points;
+	const keep = new Uint8Array(points.length);
+	keep[0] = 1;
+	keep[points.length - 1] = 1;
+	const stack: [number, number][] = [[0, points.length - 1]];
+	while (stack.length > 0) {
+		const [first, last] = stack.pop()!;
+		const a = points[first];
+		const b = points[last];
+		let maxDist = 0;
+		let index = -1;
+		for (let i = first + 1; i < last; i++) {
+			const dist = segmentDistance(points[i], a, b);
+			if (dist > maxDist) {
+				maxDist = dist;
+				index = i;
+			}
+		}
+		if (index !== -1 && maxDist > tolerance) {
+			keep[index] = 1;
+			stack.push([first, index], [index, last]);
+		}
+	}
+	return points.filter((_, i) => keep[i] === 1);
+}
+
+/** Whether (x, y) is within `radius` of a freehand stroke's line (whose
+ * own width is added on). */
+function strokeNear(elem: Pick<FreehandElement, "points" | "size">, x: number, y: number, radius: number): boolean {
+	const reach = radius + elem.size;
+	const outline = boxAround(elem.points);
+	const p = { x, y };
+	if (!outline || !boxHas(grow(outline, reach + elem.size), p)) return false;
+	// Each point against the segment leading up to it; the first point
+	// against itself, which also covers single-point dots.
+	return elem.points.some((pt, i) => segmentDistance(p, elem.points[Math.max(0, i - 1)], pt) <= reach);
+}
+
+interface Rect {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+}
+
+function unionRect(rects: Rect[]): Rect | null {
+	const box = boxAround(rects.flatMap((r) => [{ x: r.x, y: r.y }, { x: r.x + r.width, y: r.y + r.height }]));
+	return box && { x: box.left, y: box.top, width: box.right - box.left, height: box.bottom - box.top };
+}
+
+function boxOfRect(r: Rect): Box {
+	return { left: r.x, top: r.y, right: r.x + r.width, bottom: r.y + r.height };
+}
+
+/** Even-odd ray cast. */
+function pointInPolygon(x: number, y: number, poly: Point[]): boolean {
+	let inside = false;
+	for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+		const a = poly[i];
+		const b = poly[j];
+		if (a.y > y !== b.y > y && x < ((b.x - a.x) * (y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+	}
+	return inside;
+}
+
+/** "#rrggbb" -> "r, g, b" (for building rgba() strings), or null. */
+function hexToRgb(hex: string): string | null {
+	const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+	if (!m) return null;
+	const n = parseInt(m[1], 16);
+	return `${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}`;
+}
+
+function clampZoom(zoom: number): number {
+	return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom));
+}
+
+/** Black or white, whichever reads better on `hex`. */
+function contrastColor(hex: string): string {
+	const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+	if (!m) return "#ffffff";
+	const n = parseInt(m[1], 16);
+	const lum = (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+	return lum > 0.6 ? "#1e1e1e" : "#ffffff";
+}
+
+/** Snaps the direction from `from` to `to` to a multiple of 15 degrees,
+ * keeping the distance. */
+function snapAngle(from: Point, to: Point): Point {
+	const dx = to.x - from.x;
+	const dy = to.y - from.y;
+	const len = Math.hypot(dx, dy);
+	const step = Math.PI / 12;
+	const a = Math.round(Math.atan2(dy, dx) / step) * step;
+	return { x: round1(from.x + Math.cos(a) * len), y: round1(from.y + Math.sin(a) * len) };
+}
+
+/** Bounding box of an element's rendered SVG, including a shape's label. */
+function elementBBox(elem: DrawnElement): Rect {
+	const b = elem.el.getBBox();
+	const box = { x: b.x, y: b.y, width: b.width, height: b.height };
+	if (elem.kind !== "freehand" && elem.kind !== "text" && elem.labelEl) {
+		const l = elem.labelEl.getBBox();
+		const minX = Math.min(box.x, l.x);
+		const minY = Math.min(box.y, l.y);
+		box.width = Math.max(box.x + box.width, l.x + l.width) - minX;
+		box.height = Math.max(box.y + box.height, l.y + l.height) - minY;
+		box.x = minX;
+		box.y = minY;
+	}
+	return box;
+}
+
+/** Hit-test used by the eraser and select tools. Freehand strokes use precise
+ * point-to-segment distance; every other kind uses its bounding box (padded
+ * by the hit radius) -- clicking anywhere inside an unfilled rectangle still
+ * selects it, which matches how most diagramming tools behave. */
+function elementHit(elem: DrawnElement, x: number, y: number, radius: number): boolean {
+	if (elem.kind === "freehand") return strokeNear(elem, x, y, radius);
+	const b = elementBBox(elem);
+	return x >= b.x - radius && x <= b.x + b.width + radius && y >= b.y - radius && y <= b.y + b.height + radius;
+}
+
+function isBindable(e: DrawnElement): e is ShapeElement | TextElement {
+	return e.kind === "text" || e.kind === "image" || isClosedShape(e);
+}
+
+/** stroke-dasharray for a dashed/dotted stroke of width `size`. */
+function dashArray(dash: DashStyle | undefined, size: number): string | null {
+	if (dash === "dashed") return `${fmt(Math.max(size * 3, 6))} ${fmt(Math.max(size * 2.5, 5))}`;
+	if (dash === "dotted") return `0 ${fmt(Math.max(size * 2, 4))}`;
+	return null;
+}
+
+/** Reads an image file into a data: URL, downscaled to IMAGE_MAX_PX on its
+ * longest side (it's stored inside the drawing). */
+async function loadImageFile(file: File): Promise<{ href: string; width: number; height: number }> {
+	const original = await new Promise<string>((resolve, reject) => {
+		const reader = new FileReader();
+		reader.onload = () => resolve(String(reader.result));
+		reader.onerror = () => reject(new Error("Couldn't read the image."));
+		reader.readAsDataURL(file);
+	});
+	const img = new Image();
+	await new Promise<void>((resolve, reject) => {
+		img.onload = () => resolve();
+		img.onerror = () => reject(new Error("That image format isn't supported."));
+		img.src = original;
+	});
+	const w = img.naturalWidth || 300;
+	const h = img.naturalHeight || 200;
+	const scale = Math.min(1, IMAGE_MAX_PX / Math.max(w, h));
+	if (scale === 1 || file.type === "image/svg+xml") return { href: original, width: w, height: h };
+	const canvas = document.createElement("canvas");
+	canvas.width = Math.round(w * scale);
+	canvas.height = Math.round(h * scale);
+	const ctx = canvas.getContext("2d");
+	if (!ctx) return { href: original, width: w, height: h };
+	ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+	// PNGs may be transparent; anything else (photos) is smaller as JPEG.
+	const href = file.type === "image/png" ? canvas.toDataURL("image/png") : canvas.toDataURL("image/jpeg", 0.85);
+	return { href, width: canvas.width, height: canvas.height };
+}
+
+/** The background paper as a <pattern> (for saving it into the file).
+ * Matches the CSS backgrounds used while editing. */
+function paperPattern(paper: Exclude<Paper, "none">): string {
+	const n = PAPER_SPACING[paper];
+	const inner =
+		paper === "dots"
+			? `<circle cx="${n / 2}" cy="${n / 2}" r="1.3" fill="${PAPER_COLOR}"/>`
+			: paper === "grid"
+				? `<rect width="${n}" height="1" fill="${PAPER_COLOR}"/><rect width="1" height="${n}" fill="${PAPER_COLOR}"/>`
+				: `<rect width="${n}" height="1" fill="${PAPER_COLOR}"/>`;
+	return `<pattern id="qs-paper" patternUnits="userSpaceOnUse" width="${n}" height="${n}">${inner}</pattern>`;
+}
+
+/** The element's outermost DOM node (a labeled shape's wrapping group). */
+function rootNode(e: DrawnElement): Element {
+	return (e.kind !== "freehand" && e.kind !== "text" && e.labelGroup) || e.el;
+}
+
+function offsetSerialized(s: SerializedElement, dx: number, dy: number): SerializedElement {
+	if (s.kind === "freehand") return { ...s, points: s.points.map((p) => ({ x: round1(p.x + dx), y: round1(p.y + dy), p: p.p })) };
+	if (s.kind === "text") return { ...s, x: s.x + dx, y: s.y + dy };
+	return { ...s, x0: s.x0 + dx, y0: s.y0 + dy, x1: s.x1 + dx, y1: s.y1 + dy };
+}
+
+/** `d` for a freehand stroke: its centerline, or for a pressure stroke the
+ * filled outline. */
+function freehandPathData(points: Point[], size: number, pressure: boolean): string {
+	return pressure ? pressureOutline(points, size) : buildSmoothPath(points);
+}
+
+/** Some pens report 0 on the first event of a stroke; treat that as normal. */
+function penPressure(evt: PointerEvent): number {
+	return evt.pressure > 0 ? Math.min(1, evt.pressure) : 0.5;
+}
+
+function isClosedShape(e: DrawnElement): e is ShapeElement {
+	return e.kind === "rectangle" || e.kind === "ellipse" || e.kind === "diamond" || e.kind === "triangle";
+}
+
+/** Parses SVG markup we wrote ourselves (static, built from numbers only)
+ * into an element -- without innerHTML. The markup needs its xmlns. */
+function parseSvg(markup: string): Element {
+	return document.importNode(new DOMParser().parseFromString(markup, "image/svg+xml").documentElement, true);
+}
+
+/** Toolbar glyphs (see parseSvg). */
+function glyph(inner: string): string {
+	return `<svg xmlns="${SVG_NS}" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`;
+}
+function lineIcon(width: number): string {
+	return glyph(`<line x1="5" y1="12" x2="19" y2="12" stroke-width="${width}"/>`);
+}
+function fillIcon(opacity: number): string {
+	return glyph(`<rect x="4" y="4" width="16" height="16" rx="3" stroke-width="2" fill="currentColor" fill-opacity="${opacity}"/>`);
+}
+function dashIcon(dash: DashStyle): string {
+	const pattern = dash === "dashed" ? ` stroke-dasharray="5 3.5"` : dash === "dotted" ? ` stroke-dasharray="0 4"` : "";
+	return glyph(`<line x1="4" y1="12" x2="20" y2="12" stroke-width="${dash === "dotted" ? 2.5 : 2}"${pattern}/>`);
+}
+function trailIcon(trail: LaserTrail): string {
+	if (trail === "hold") return glyph(`<path d="M3 15c3-7 6-7 9-3s6 4 9-3" stroke-width="2"/>`);
+	if (trail === "long") return glyph(`<path d="M3 12h5" stroke-width="2" opacity=".25"/><path d="M8 12h5" stroke-width="2" opacity=".55"/><path d="M13 12h7" stroke-width="2"/>`);
+	return glyph(`<path d="M9 12h4" stroke-width="2" opacity=".35"/><path d="M13 12h6" stroke-width="2"/>`);
+}
+function headsIcon(start: boolean, end: boolean): string {
+	let inner = `<line x1="4" y1="12" x2="20" y2="12" stroke-width="2"/>`;
+	if (end) inner += `<path d="M14 7l6 5-6 5" stroke-width="2"/>`;
+	if (start) inner += `<path d="M10 7l-6 5 6 5" stroke-width="2"/>`;
+	return glyph(inner);
+}
+
+export class DrawingView extends ItemView {
+	private filePath: string | null = null;
+	private svgEl!: SVGSVGElement;
+	private elementsGroup!: SVGGElement;
+	private overlayGroup!: SVGGElement;
+	private toolbarEl!: HTMLElement;
+	private actionsEl!: HTMLElement;
+	/** The movable panel holding the style options (stylePanelEl). */
+	private styleDockEl!: HTMLElement;
+	private stylePanelEl!: HTMLElement;
+	private zoomEl!: HTMLElement;
+	private zoomLabelEl: HTMLElement | null = null;
+	/** What the style panel was last built for; rebuilt only when it changes. */
+	private stylePanelKey = "";
+	private canvasWrapEl!: HTMLElement;
+
+
+	private tool: Tool = DEFAULT_TOOL;
+	private currentColor = DEFAULT_COLOR;
+	private currentHighlightColor = HIGHLIGHT_COLORS[0];
+	private currentSize = DEFAULT_STROKE_PX;
+	/** The highlighter keeps its own S/M/L choice, independent of the pen's. */
+	private currentHighlightSize = DEFAULT_STROKE_PX;
+	private currentFill: FillStyle = "none";
+	private currentArrowHeads: ArrowHeads = "end";
+	private currentDash: DashStyle = "solid";
+	/** Background paper of this drawing (saved in the file). */
+	private paper: Paper = "none";
+	/** Presentation mode: UI hidden, laser on; the tool to go back to. */
+	private presenting = false;
+	private toolBeforePresenting: Tool | null = null;
+	private presentExitEl: HTMLElement | null = null;
+	/** Shape recognition: fires when the pen rests at `anchor` long enough. */
+	private recognizeTimer: number | null = null;
+	private recognizeAnchor: Point | null = null;
+	/** Cmd/Ctrl+V pastes copied elements unless a paste event brings an image. */
+	private pasteFallbackTimer: number | null = null;
+	private imageInputEl: HTMLInputElement | null = null;
+	/** The variant each grouped toolbar button switches to. */
+	private lastShapeTool: Tool = "rectangle";
+	private lastSelectTool: Tool = "select";
+
+	private elements: DrawnElement[] = [];
+	private activeStroke: ActiveDrawStroke | null = null;
+	private activeShapeDraw: ActiveShapeDraw | null = null;
+
+	private textEditor: HTMLTextAreaElement | null = null;
+	private textEditorCanvasPoint: Point | null = null;
+	/** Set when the open text editor is editing a shape's label rather than
+	 * placing a new text element, or an existing text element. */
+	private textEditorTarget: ShapeElement | TextElement | null = null;
+	/** Last select-tool tap on an element, for double-tap detection. */
+	private lastSelectTap: { id: string; time: number } | null = null;
+
+	private erasing = false;
+	private eraseDragPointerId: number | null = null;
+	private eraseSnapshotTaken = false;
+
+	/** Ids of the selected elements. */
+	private selection = new Set<string>();
+	/** The rectangle being dragged out to select (select tool). */
+	private marquee: Marquee | null = null;
+	private selectionDrag: SelectionDrag | null = null;
+	private selectionResize: SelectionResize | null = null;
+	private endpointDrag: EndpointDrag | null = null;
+	private lasso: Lasso | null = null;
+	/** Handles as last drawn, in canvas coordinates, for hit-testing. */
+	private handles: { id: HandleId; x: number; y: number }[] = [];
+	/** Shape an arrow end being drawn/dragged would attach to, outlined. */
+	private bindHighlightId: string | null = null;
+	/** Space held (desktop): any drag pans. */
+	private spaceHeld = false;
+	private pasteCount = 0;
+	private lastNudgeAt = 0;
+
+	private panDrag: PanDrag | null = null;
+	private laser: LaserState | null = null;
+
+	/** Snapshots of the drawing for undo/redo. */
+	private readonly history = new History<SerializedElement[]>(200);
+
+	/** Toolbar/panel controls that are highlighted while their condition
+	 * holds (the current tool, color, size...). Rechecked by refreshUi. */
+	private highlighted: { el: HTMLElement; when: () => boolean }[] = [];
+
+	// Pan/zoom is a CSS transform on svgEl, driven manually from pointer/wheel
+	// events -- not native scroll -- so that touch-action can stay "none" and
+	// a stylus never triggers the browser's own pan/zoom gesture handling.
+	private panX = 0;
+	private panY = 0;
+	private zoom = 1;
+	private touchPoints: Map<number, Point> = new Map();
+	private lastPenActivity = 0;
+	private diag: InputDiagnostics | null = null;
+
+	private dirty = false;
+	private saveTimer: number | null = null;
+
+	constructor(
+		leaf: WorkspaceLeaf,
+		private readonly plugin: QuickSketchPlugin
+	) {
+		super(leaf);
+		const s = plugin.settings;
+		this.tool = s.defaultTool;
+		this.currentColor = s.defaultColor;
+		this.currentSize = s.defaultSize;
+		if (SHAPE_TOOLS.has(this.tool)) this.lastShapeTool = this.tool;
+		if (SELECT_TOOLS.has(this.tool)) this.lastSelectTool = this.tool;
+	}
+
+	getViewType(): string {
+		return VIEW_TYPE_DRAWING;
+	}
+
+	getDisplayText(): string {
+		if (!this.filePath) return "Drawing";
+		const name = this.filePath.split("/").pop() ?? "Drawing";
+		return name.replace(/\.svg$/i, "");
+	}
+
+	getIcon(): string {
+		return "pencil";
+	}
+
+	async onOpen(): Promise<void> {
+		this.buildUI();
+		// Registered through Obsidian, which removes them when the view closes.
+		this.registerDomEvent(window, "keydown", (e) => this.onKeyDown(e));
+		this.registerDomEvent(window, "keyup", (e) => {
+			if (e.key !== " " || !this.spaceHeld) return;
+			this.spaceHeld = false;
+			this.applyToolClass();
+		});
+		this.registerDomEvent(window, "paste", (e) => this.handlePaste(e));
+		this.registerDomEvent(document, "fullscreenchange", () => {
+			if (!this.presenting) return;
+			// Entered full screen: refit to the new size. Left it (Esc): stop.
+			if (document.fullscreenElement === this.contentEl) requestAnimationFrame(() => this.fitToContent());
+			else this.exitPresentation();
+		});
+		if (this.filePath) {
+			await this.loadFromFile();
+		}
+		this.centerView();
+	}
+
+	async onClose(): Promise<void> {
+		if (this.diag) this.toggleDiagnostics();
+		if (this.presenting) this.exitPresentation();
+		this.clearLaser();
+		this.disarmRecognizer();
+		if (this.pasteFallbackTimer !== null) window.clearTimeout(this.pasteFallbackTimer);
+		this.cancelTextEditor();
+		if (this.canvasWrapEl) {
+			this.canvasWrapEl.removeEventListener("pointerdown", this.onPointerDown);
+			this.canvasWrapEl.removeEventListener("pointermove", this.onPointerMove);
+			this.canvasWrapEl.removeEventListener("pointerup", this.onPointerUp);
+			this.canvasWrapEl.removeEventListener("pointercancel", this.onPointerUp);
+			this.canvasWrapEl.removeEventListener("pointerleave", this.onPointerLeave);
+			this.canvasWrapEl.removeEventListener("wheel", this.onWheel);
+		}
+		await this.flushSave();
+	}
+
+	async setState(state: unknown, result: ViewStateResult): Promise<void> {
+		const file = (state as { file?: string } | undefined)?.file;
+		if (file) {
+			this.filePath = file;
+			if (this.svgEl) {
+				await this.loadFromFile();
+				this.centerView();
+			}
+		}
+		await super.setState(state, result);
+	}
+
+	getState(): Record<string, unknown> {
+		return { file: this.filePath };
+	}
+
+	private buildUI(): void {
+		const container = this.contentEl;
+		container.empty();
+		container.addClass("quick-sketch-view");
+
+		const canvasWrap = container.createDiv({ cls: "quick-sketch-canvas-wrap" });
+		this.canvasWrapEl = canvasWrap;
+
+		this.svgEl = document.createElementNS(SVG_NS, "svg") as SVGSVGElement;
+		this.svgEl.setAttribute("width", String(WORKSPACE_SIZE));
+		this.svgEl.setAttribute("height", String(WORKSPACE_SIZE));
+		this.svgEl.classList.add("quick-sketch-canvas");
+		this.svgEl.style.transformOrigin = "0 0";
+
+		this.elementsGroup = document.createElementNS(SVG_NS, "g") as SVGGElement;
+		this.svgEl.appendChild(this.elementsGroup);
+
+		this.overlayGroup = document.createElementNS(SVG_NS, "g") as SVGGElement;
+		this.overlayGroup.classList.add("quick-sketch-overlay");
+		this.svgEl.appendChild(this.overlayGroup);
+
+		canvasWrap.appendChild(this.svgEl);
+
+		// Floating controls over the canvas. They're siblings of the canvas
+		// wrapper, not children, so presses on them never reach its pointer
+		// handlers.
+		const topbar = container.createDiv({ cls: "qs-topbar" });
+		topbar.createDiv({ cls: "qs-topbar-spacer" });
+		// Tools, with the style panel for the current tool right below them.
+		const center = topbar.createDiv({ cls: "qs-topbar-center" });
+		this.toolbarEl = center.createDiv({ cls: "qs-island qs-tools" });
+		const right = topbar.createDiv({ cls: "qs-topbar-right" });
+		this.actionsEl = right.createDiv({ cls: "qs-island qs-actions" });
+		// The current tool's options: a single column at the right, which
+		// can be dragged elsewhere by its grip.
+		this.styleDockEl = container.createDiv({ cls: "qs-island qs-style-panel" });
+		this.makeDockDraggable(this.styleDockEl.createDiv({ cls: "qs-grip", attr: { "aria-label": "Drag to move (double-click to put back)", title: "Drag to move (double-click to put back)" } }));
+		this.stylePanelEl = this.styleDockEl.createDiv({ cls: "qs-style-body" });
+		this.zoomEl = container.createDiv({ cls: "qs-island qs-zoom" });
+
+		this.createToolbar();
+		this.applyToolClass();
+		this.applyPaper();
+
+		// Listeners live on the wrapper (not the svg) so panning/zooming still
+		// works when zoomed out far enough that empty wrapper space is showing
+		// around the canvas.
+		canvasWrap.addEventListener("pointerdown", this.onPointerDown);
+		canvasWrap.addEventListener("pointermove", this.onPointerMove);
+		canvasWrap.addEventListener("pointerup", this.onPointerUp);
+		canvasWrap.addEventListener("pointercancel", this.onPointerUp);
+		canvasWrap.addEventListener("pointerleave", this.onPointerLeave);
+		canvasWrap.addEventListener("wheel", this.onWheel, { passive: false });
+		canvasWrap.addEventListener("dragover", (evt) => {
+			if (evt.dataTransfer?.types.includes("Files")) {
+				evt.preventDefault();
+				evt.dataTransfer.dropEffect = "copy";
+			}
+		});
+		canvasWrap.addEventListener("drop", (evt) => {
+			const files = Array.from(evt.dataTransfer?.files ?? []).filter((f) => f.type.startsWith("image/"));
+			if (files.length === 0) return;
+			evt.preventDefault();
+			evt.stopPropagation();
+			void this.insertImageFiles(files, this.toCanvasPoint(evt));
+		});
+
+		// For "Insert image": a real (if invisible) file input in the DOM --
+		// iOS only opens the picker for inputs that are part of the page.
+		const input = container.createEl("input", { type: "file", cls: "qs-image-input", attr: { accept: "image/*", multiple: "" } });
+		input.addEventListener("change", () => {
+			const files = Array.from(input.files ?? []);
+			input.value = "";
+			if (files.length > 0) void this.insertImageFiles(files);
+		});
+		this.imageInputEl = input;
+
+		// iPadOS/WebKit runs its own gesture recognizers (double-tap zoom, the
+		// text-selection loupe, Scribble) on raw touch events, *independently*
+		// of pointer events -- preventDefault() on pointerdown doesn't stop
+		// them. A natural lift-and-retouch of the Apple Pencil looks like a
+		// double tap, so WebKit holds the new contact while it decides, which
+		// shows up as delayed ink. Cancelling the touch events themselves
+		// (non-passive) opts the canvas out of those recognizers. Pointer
+		// events are still delivered, so drawing/pan/pinch are unaffected.
+		for (const type of ["touchstart", "touchmove", "touchend"] as const) {
+			canvasWrap.addEventListener(type, this.onRawTouch, { passive: false });
+		}
+	}
+
+	private onRawTouch = (evt: TouchEvent): void => {
+		// Leave the inline text editor alone so it can still focus/select.
+		const target = evt.target as HTMLElement | null;
+		if (target?.closest("textarea, input")) return;
+		if (evt.cancelable) evt.preventDefault();
+	};
+
+	private createToolbar(): void {
+		const tb = this.toolbarEl;
+		tb.empty();
+		this.groupSyncs = [];
+
+		this.groupButton(
+			tb,
+			[
+				{ tool: "select", name: "Select", key: "V", icon: ICON.pointer },
+				{ tool: "lasso", name: "Lasso select", key: "F", icon: ICON.lasso },
+			],
+			() => this.lastSelectTool
+		);
+		this.btn(tb, "Pan (or hold Space / drag with two fingers)", ICON.hand, () => this.setTool("pan"), () => this.tool === "pan");
+		this.btn(tb, "Laser pointer (K)", ICON.laser, () => this.setTool("laser"), () => this.tool === "laser");
+		tb.createDiv({ cls: "qs-sep" });
+		this.btn(tb, "Pen (P)", ICON.pencil, () => this.setTool("pencil"), () => this.tool === "pencil");
+		this.btn(tb, "Highlighter (H)", ICON.highlighter, () => this.setTool("highlighter"), () => this.tool === "highlighter");
+		this.btn(tb, "Eraser (E)", ICON.eraser, () => this.setTool("eraser"), () => this.tool === "eraser");
+		tb.createDiv({ cls: "qs-sep" });
+		this.groupButton(
+			tb,
+			[
+				{ tool: "rectangle", name: "Rectangle", key: "S", icon: ICON.rectangle },
+				{ tool: "ellipse", name: "Ellipse", key: "C", icon: ICON.ellipse },
+				{ tool: "diamond", name: "Diamond", key: "D", icon: ICON.diamond },
+				{ tool: "line", name: "Line", key: "L", icon: ICON.line },
+				{ tool: "arrow", name: "Arrow", key: "A", icon: ICON.arrow },
+			],
+			() => this.lastShapeTool
+		);
+		this.btn(tb, "Text (T)", ICON.text, () => this.setTool("text"), () => this.tool === "text");
+
+		const actions = this.actionsEl;
+		actions.empty();
+		this.btn(actions, "Present (laser pointer, hidden toolbar)", ICON.present, () => this.togglePresentation());
+		this.btn(actions, "Undo (Cmd/Ctrl+Z)", ICON.undo, () => this.travel("back"));
+		this.btn(actions, "Redo (Cmd/Ctrl+Shift+Z)", ICON.redo, () => this.travel("forward"));
+		const moreBtn = this.btn(actions, "More", ICON.more, () => this.openMoreMenu(moreBtn));
+		const doneBtn = actions.createEl("button", { text: "Done", cls: "mod-cta qs-done" });
+		doneBtn.onclick = () => void this.done();
+
+		const zoom = this.zoomEl;
+		zoom.empty();
+		this.btn(zoom, "Zoom out", ICON.minus, () => this.zoomBy(1 / 1.2));
+		const label = zoom.createEl("button", { cls: "qs-zoom-label", attr: { "aria-label": "Reset zoom to 100%", title: "Reset zoom to 100%" } });
+		label.onclick = (evt) => {
+			evt.preventDefault();
+			this.zoomBy(1 / this.zoom);
+		};
+		this.zoomLabelEl = label;
+		this.btn(zoom, "Zoom in", ICON.plus, () => this.zoomBy(1.2));
+		this.btn(zoom, "Zoom to fit", ICON.fit, () => this.fitToContent());
+
+		this.stylePanelKey = "";
+		this.refreshUi();
+	}
+
+	/** Functions that refresh each grouped tool button's icon/label. */
+	private groupSyncs: (() => void)[] = [];
+
+	/** An icon button that runs `run` when pressed; with `isActive`, it's
+	 * shown pressed while that returns true. */
+	private btn(parent: HTMLElement, label: string, icon: string, run: () => void, isActive?: () => boolean): HTMLButtonElement {
+		const button = parent.createEl("button", { cls: "quick-sketch-btn" });
+		button.setAttrs({ "aria-label": label, title: label });
+		setIcon(button, icon);
+		button.addEventListener("click", (evt) => {
+			evt.preventDefault();
+			run();
+			this.refreshUi();
+		});
+		if (isActive) this.highlightWhile(button, isActive);
+		return button;
+	}
+
+	/** Shows `el` as active (pressed/selected) whenever `when` holds. */
+	private highlightWhile(el: HTMLElement, when: () => boolean): void {
+		this.highlighted.push({ el, when });
+	}
+
+	/** One button standing for several related tools: it shows (and picks)
+	 * the last one used; pressing it while one of them is active opens a menu
+	 * of all of them. */
+	private groupButton(parent: HTMLElement, variants: { tool: Tool; name: string; key: string; icon: string }[], last: () => Tool): void {
+		// A split button: the tool itself, plus a chevron that lists all the
+		// variants (pressing the tool again while it's active does too).
+		const wrap = parent.createDiv({ cls: "qs-split" });
+		const btn = wrap.createEl("button", { cls: "quick-sketch-btn qs-group-btn" });
+		const more = wrap.createEl("button", { cls: "qs-split-more" });
+		setIcon(more, ICON.chevronDown);
+		const isActive = () => variants.some((v) => v.tool === this.tool);
+		const sync = () => {
+			const v = variants.find((x) => x.tool === last()) ?? variants[0];
+			if (btn.dataset.icon !== v.icon) {
+				btn.empty();
+				setIcon(btn, v.icon);
+				btn.dataset.icon = v.icon;
+			}
+			const label = `${v.name} (${v.key})`;
+			btn.setAttribute("aria-label", label);
+			btn.setAttribute("title", label);
+			const moreLabel = `More: ${variants.map((x) => x.name.toLowerCase()).join(", ")}`;
+			more.setAttribute("aria-label", moreLabel);
+			more.setAttribute("title", moreLabel);
+			wrap.toggleClass("is-active", isActive());
+		};
+		sync();
+		this.groupSyncs.push(sync);
+		const openMenu = () => {
+			const menu = new Menu();
+			for (const v of variants) {
+				menu.addItem((item) =>
+					item
+						.setTitle(`${v.name}  (${v.key})`)
+						.setIcon(v.icon)
+						.setChecked(v.tool === this.tool)
+						.onClick(() => this.setTool(v.tool))
+				);
+			}
+			const r = wrap.getBoundingClientRect();
+			menu.showAtPosition({ x: r.left, y: r.bottom + 6 });
+		};
+		btn.onclick = (evt) => {
+			evt.preventDefault();
+			if (isActive()) openMenu();
+			else this.setTool(last());
+		};
+		more.onclick = (evt) => {
+			evt.preventDefault();
+			openMenu();
+		};
+		this.highlightWhile(btn, isActive);
+	}
+
+
+	private openMoreMenu(anchor: HTMLElement): void {
+		const menu = new Menu();
+		menu.addItem((i) => i.setTitle("Present").setIcon(ICON.present).onClick(() => this.togglePresentation()));
+		menu.addItem((i) => i.setTitle("Insert image…").setIcon(ICON.imagePlus).onClick(() => this.pickImageFile()));
+		menu.addSeparator();
+		menu.addItem((i) => i.setTitle("Copy as PNG").setIcon(ICON.image).onClick(() => this.copyAsPng()));
+		menu.addItem((i) => i.setTitle("Copy as SVG").setIcon(ICON.copy).onClick(() => this.copyAsSvg()));
+		menu.addItem((i) => i.setTitle("Export PNG…").setIcon(ICON.download).onClick(() => void this.exportPng()));
+		menu.addItem((i) => i.setTitle("Export SVG…").setIcon(ICON.download).onClick(() => void this.exportSvg()));
+		menu.addItem((i) => i.setTitle("Export PDF…").setIcon(ICON.download).onClick(() => void this.exportPdf()));
+		menu.addSeparator();
+		const papers: [Paper, string][] = [
+			["none", "Plain paper"],
+			["dots", "Dotted paper"],
+			["grid", "Grid paper"],
+			["lines", "Lined paper"],
+		];
+		for (const [paper, name] of papers) {
+			menu.addItem((i) =>
+				i
+					.setTitle(name)
+					.setIcon(ICON.paper)
+					.setChecked(this.paper === paper)
+					.onClick(() => this.setPaper(paper))
+			);
+		}
+		menu.addSeparator();
+		menu.addItem((i) => i.setTitle("Select all (Cmd/Ctrl+A)").setIcon(ICON.pointer).onClick(() => this.selectAll()));
+		menu.addItem((i) => i.setTitle("Zoom to fit").setIcon(ICON.fit).onClick(() => this.fitToContent()));
+		menu.addItem((i) => i.setTitle("Center drawing at 100%").setIcon(ICON.reset).onClick(() => this.centerView()));
+		menu.addSeparator();
+		menu.addItem((i) => i.setTitle("Clear drawing").setIcon(ICON.clear).onClick(() => void this.confirmClear()));
+		menu.addItem((i) =>
+			i
+				.setTitle("Settings")
+				.setIcon(ICON.settings)
+				.onClick(() => {
+					const setting = (this.app as unknown as { setting?: { open(): void; openTabById(id: string): void } }).setting;
+					setting?.open();
+					setting?.openTabById(this.plugin.manifest.id);
+				})
+		);
+		const r = anchor.getBoundingClientRect();
+		menu.showAtPosition({ x: r.left, y: r.bottom + 6 });
+	}
+
+	// --- Style panel: only the options that apply to the current tool or
+	// --- selection (color, size, fill, arrowheads, selection actions).
+
+	private selectedElements(): DrawnElement[] {
+		return this.elements.filter((e) => this.selection.has(e.id));
+	}
+
+	/** Whether the panel acts on the selection rather than the next thing drawn. */
+	private editingSelection(): boolean {
+		return SELECT_TOOLS.has(this.tool) && this.selection.size > 0;
+	}
+
+	private styleContext(): StyleContext | null {
+		const none = { laser: false, stroke: false, highlight: false, fill: false, heads: false, dash: false, actions: false };
+		if (SELECT_TOOLS.has(this.tool)) {
+			const sel = this.selectedElements();
+			if (sel.length === 0) return null;
+			const drawn = sel.filter((e) => e.kind !== "image");
+			return {
+				...none,
+				stroke: drawn.length > 0,
+				highlight: drawn.length > 0 && drawn.every((e) => e.kind === "freehand" && e.highlight),
+				fill: sel.some((e) => isClosedShape(e)),
+				heads: sel.some((e) => e.kind === "arrow"),
+				dash: sel.some((e) => e.kind === "arrow" || isClosedShape(e)),
+				actions: true,
+			};
+		}
+		if (this.tool === "pan" || this.tool === "eraser") return null;
+		if (this.tool === "laser") return { ...none, laser: true };
+		return {
+			...none,
+			stroke: true,
+			highlight: this.tool === "highlighter",
+			fill: CLOSED_SHAPE_TOOLS.has(this.tool),
+			heads: this.tool === "arrow",
+			dash: SHAPE_TOOLS.has(this.tool),
+		};
+	}
+
+	/** The element whose style the panel shows while editing a selection. */
+	private styleSample(): DrawnElement | undefined {
+		return this.editingSelection() ? this.selectedElements().find((e) => e.kind !== "image") : undefined;
+	}
+
+	private shownColor(): string {
+		const s = this.styleSample();
+		if (s) return s.color;
+		return this.tool === "highlighter" ? this.currentHighlightColor : this.currentColor;
+	}
+
+	private shownSize(): number {
+		const s = this.styleSample();
+		if (s) {
+			if (s.kind === "freehand") return s.highlight ? s.size / HIGHLIGHT_SIZE_MULTIPLIER : s.size;
+			if (s.kind === "text") return s.size / TEXT_SIZE_MULTIPLIER;
+			return s.size;
+		}
+		return this.tool === "highlighter" ? this.currentHighlightSize : this.currentSize;
+	}
+
+	private shownFill(): FillStyle {
+		const s = this.selectedElements().find((e) => isClosedShape(e)) as ShapeElement | undefined;
+		if (this.editingSelection()) return s?.fill ?? "none";
+		return this.currentFill;
+	}
+
+	private shownDash(): DashStyle {
+		const s = this.selectedElements().find((e) => e.kind === "arrow" || isClosedShape(e)) as ShapeElement | undefined;
+		if (this.editingSelection()) return s?.dash ?? "solid";
+		return this.currentDash;
+	}
+
+	private shownHeads(): ArrowHeads {
+		const s = this.selectedElements().find((e) => e.kind === "arrow") as ShapeElement | undefined;
+		if (this.editingSelection()) return s?.heads ?? "end";
+		return this.currentArrowHeads;
+	}
+
+	private buildStylePanel(): void {
+		const panel = this.stylePanelEl;
+		panel.empty();
+		const ctx = this.styleContext();
+		this.styleDockEl.toggle(!!ctx);
+		if (!ctx) return;
+		// Its height depends on the tool; keep it inside the editor.
+		requestAnimationFrame(() => this.placeDock());
+
+		// Sections are stacked with a divider between them; the narrow
+		// column has no room for titles, so they're tooltips.
+		const section = (title: string): HTMLElement => {
+			const sec = panel.createDiv({ cls: "qs-section", attr: { title, "aria-label": title, role: "group" } });
+			return sec.createDiv({ cls: "qs-section-body" });
+		};
+
+		if (ctx.laser) {
+			const settings = this.plugin.settings;
+			const colors = section("Laser color");
+			colors.addClass("qs-swatches");
+			for (const color of LASER_COLORS) {
+				const sw = colors.createEl("button", { cls: "quick-sketch-swatch", attr: { "aria-label": color, title: color } });
+				sw.style.setProperty("--qs-swatch-color", color);
+				sw.onclick = (evt) => {
+					evt.preventDefault();
+					settings.laserColor = color;
+					void this.plugin.saveSettings();
+					this.requestLaserFrame();
+					this.refreshUi();
+				};
+				this.highlightWhile(sw, () => settings.laserColor.toLowerCase() === color.toLowerCase());
+			}
+			const trails = section("Trail");
+			const options: [LaserTrail, string][] = [
+				["short", "Short trail"],
+				["long", "Long trail"],
+				["hold", "Keep until the next stroke (Esc clears)"],
+			];
+			for (const [value, name] of options) {
+				const b = this.optionButton(trails, name, trailIcon(value), () => {
+					settings.laserTrail = value;
+					void this.plugin.saveSettings();
+					this.fadeLaserTrails();
+				});
+				this.highlightWhile(b, () => settings.laserTrail === value);
+			}
+			return;
+		}
+
+		if (ctx.stroke) this.buildStrokeSections(ctx, section);
+
+		if (ctx.dash) {
+			const styles = section("Line style");
+			const options: [DashStyle, string][] = [
+				["solid", "Solid"],
+				["dashed", "Dashed"],
+				["dotted", "Dotted"],
+			];
+			for (const [value, name] of options) {
+				const b = this.optionButton(styles, name, dashIcon(value), () => this.pickDash(value));
+				this.highlightWhile(b, () => this.shownDash() === value);
+			}
+		}
+
+		if (ctx.fill) this.buildFillSection(section);
+		if (ctx.heads) this.buildHeadsSection(section);
+
+		if (ctx.actions) {
+			const acts = section("Selection");
+			this.btn(acts, "Duplicate (Cmd/Ctrl+D)", ICON.duplicate, () => this.duplicateSelection());
+			this.btn(acts, "Copy (Cmd/Ctrl+C)", ICON.copy, () => this.copySelection());
+			this.btn(acts, "Delete (Delete)", ICON.trash, () => this.deleteSelected());
+		}
+	}
+
+	/** Color and size sections. */
+	private buildStrokeSections(ctx: StyleContext, section: (title: string) => HTMLElement): void {
+		const colors = section("Color");
+		colors.addClass("qs-swatches");
+		const palette = ctx.highlight ? HIGHLIGHT_COLORS : this.paletteColors();
+		for (const color of palette) {
+			const isCustom = !ctx.highlight && !COLORS.includes(color);
+			const sw = colors.createEl("button", {
+				cls: isCustom ? "quick-sketch-swatch quick-sketch-swatch-custom" : "quick-sketch-swatch",
+				attr: { "aria-label": color, title: isCustom ? `${color} (right-click to remove)` : color },
+			});
+			sw.style.setProperty("--qs-swatch-color", color);
+			sw.onclick = (evt) => {
+				evt.preventDefault();
+				this.pickColor(color);
+			};
+			if (isCustom) {
+				sw.addEventListener("contextmenu", (evt) => {
+					evt.preventDefault();
+					void askToConfirm(this.app, `Remove ${color} from the palette?`, "Remove").then((yes) => {
+						if (yes) void this.removeFromPalette(color);
+					});
+				});
+			}
+			this.highlightWhile(sw, () => this.shownColor().toLowerCase() === color.toLowerCase());
+		}
+		if (!ctx.highlight) {
+			const add = colors.createDiv({
+				cls: "quick-sketch-swatch quick-sketch-swatch-add",
+				attr: { "aria-label": "Add a color", title: "Add a color" },
+			});
+			add.setText("+");
+			// The press has to land on the color input itself: Safari on
+			// iPad only shows its picker for a direct tap, not when a script
+			// clicks the input. So the input covers the "+" (see styles.css)
+			// and is invisible.
+			const picker = add.createEl("input", { type: "color", value: this.shownColor() });
+			picker.addEventListener("change", () => void this.addToPalette(picker.value));
+		}
+
+		// Stroke width / text size.
+		const sizes = section(this.tool === "text" ? "Text size" : "Size");
+		const lineWidths = [1.5, 3.5, 6];
+		STROKE_SIZES.forEach((size, i) => {
+			const b = this.optionButton(sizes, size.label === "S" ? "Small" : size.label === "M" ? "Medium" : "Large", lineIcon(lineWidths[i]), () =>
+				this.pickSize(size.px)
+			);
+			this.highlightWhile(b, () => this.shownSize() === size.px);
+		});
+
+	}
+
+	private buildFillSection(section: (title: string) => HTMLElement): void {
+		{
+			const fills = section("Fill");
+			const options: [FillStyle, string, string][] = [
+				["none", "No fill", fillIcon(0)],
+				["light", "Light fill", fillIcon(0.3)],
+				["solid", "Solid fill", fillIcon(1)],
+			];
+			for (const [value, name, svg] of options) {
+				const b = this.optionButton(fills, name, svg, () => this.pickFill(value));
+				this.highlightWhile(b, () => this.shownFill() === value);
+			}
+		}
+
+	}
+
+	private buildHeadsSection(section: (title: string) => HTMLElement): void {
+		{
+			const ends = section("Arrowheads");
+			const options: [ArrowHeads, string, string][] = [
+				["none", "No arrowheads", headsIcon(false, false)],
+				["end", "Arrowhead at end", headsIcon(false, true)],
+				["both", "Arrowheads at both ends", headsIcon(true, true)],
+			];
+			for (const [value, name, svg] of options) {
+				const b = this.optionButton(ends, name, svg, () => this.pickHeads(value));
+				this.highlightWhile(b, () => this.shownHeads() === value);
+			}
+		}
+	}
+
+	/** Lets the style panel be dragged around by `grip`. Where it's dropped
+	 * is remembered relative to the nearer side, so it stays on that side
+	 * when the editor is resized. Double-clicking the grip puts it back. */
+	private makeDockDraggable(grip: HTMLElement): void {
+		setIcon(grip, ICON.grip);
+		const dock = this.styleDockEl;
+		const settings = this.plugin.settings;
+		grip.addEventListener("pointerdown", (down) => {
+			if (down.button !== 0) return;
+			down.preventDefault();
+			grip.setPointerCapture(down.pointerId);
+			const host = this.contentEl.getBoundingClientRect();
+			const start = dock.getBoundingClientRect();
+			const grabX = down.clientX - start.left;
+			const grabY = down.clientY - start.top;
+			dock.addClass("is-dragging");
+			const move = (evt: PointerEvent) => {
+				if (evt.pointerId !== down.pointerId) return;
+				// "auto", not "": the stylesheet's default `right` would
+				// otherwise still apply and stretch the panel.
+				dock.style.right = "auto";
+				dock.style.left = `${evt.clientX - host.left - grabX}px`;
+				dock.style.top = `${evt.clientY - host.top - grabY}px`;
+			};
+			const drop = (evt: PointerEvent) => {
+				if (evt.pointerId !== down.pointerId) return;
+				grip.removeEventListener("pointermove", move);
+				grip.removeEventListener("pointerup", drop);
+				grip.removeEventListener("pointercancel", drop);
+				dock.removeClass("is-dragging");
+				const box = dock.getBoundingClientRect();
+				const left = box.left - host.left;
+				const onLeft = left + box.width / 2 < host.width / 2;
+				settings.stylePanelPos = {
+					side: onLeft ? "left" : "right",
+					x: Math.round(onLeft ? left : host.width - left - box.width),
+					y: Math.round(box.top - host.top),
+				};
+				void this.plugin.saveSettings();
+				this.placeDock();
+			};
+			grip.addEventListener("pointermove", move);
+			grip.addEventListener("pointerup", drop);
+			grip.addEventListener("pointercancel", drop);
+		});
+		grip.addEventListener("dblclick", () => {
+			settings.stylePanelPos = null;
+			void this.plugin.saveSettings();
+			this.placeDock();
+		});
+	}
+
+	/** Puts the style panel where it was dragged to (or its default place),
+	 * kept inside the editor, and caps its height to the room below it --
+	 * its options scroll if they don't fit. */
+	private placeDock(): void {
+		const dock = this.styleDockEl;
+		if (!dock || dock.hasClass("is-dragging")) return;
+		const margin = 10;
+		const hostW = this.contentEl.clientWidth;
+		const hostH = this.contentEl.clientHeight;
+		const pos = this.plugin.settings.stylePanelPos;
+		// Default: top right, under the Undo/Redo/Done island.
+		const side = pos?.side ?? "right";
+		const top = Math.max(margin, Math.min(pos?.y ?? 58, hostH - 120));
+		const x = Math.max(margin, Math.min(pos?.x ?? margin, hostW - dock.offsetWidth - margin));
+		dock.style.top = `${top}px`;
+		dock.style.left = side === "left" ? `${x}px` : "auto";
+		dock.style.right = side === "right" ? `${x}px` : "auto";
+		dock.style.maxHeight = `${Math.max(120, hostH - top - margin)}px`;
+	}
+
+	onResize(): void {
+		this.placeDock();
+	}
+
+	private optionButton(parent: HTMLElement, label: string, svg: string, onClick: () => void): HTMLButtonElement {
+		const b = parent.createEl("button", { cls: "quick-sketch-btn qs-opt-btn", attr: { "aria-label": label, title: label } });
+		// Static markup built from numbers only (see lineIcon etc.).
+		b.appendChild(parseSvg(svg));
+		b.onclick = (evt) => {
+			evt.preventDefault();
+			onClick();
+			this.refreshUi();
+		};
+		return b;
+	}
+
+	private pickColor(color: string): void {
+		const highlightPalette = HIGHLIGHT_COLORS.includes(color) && (this.tool === "highlighter" || this.styleContext()?.highlight);
+		if (highlightPalette) this.currentHighlightColor = color;
+		else this.currentColor = color;
+		if (this.editingSelection()) this.applyStyle({ color });
+		this.refreshUi();
+	}
+
+	private pickSize(px: number): void {
+		if (this.tool === "highlighter" || this.styleContext()?.highlight) this.currentHighlightSize = px;
+		else this.currentSize = px;
+		if (this.editingSelection()) this.applyStyle({ sizePx: px });
+		this.refreshUi();
+	}
+
+	private pickFill(fill: FillStyle): void {
+		this.currentFill = fill;
+		if (this.editingSelection()) this.applyStyle({ fill });
+		this.refreshUi();
+	}
+
+	private pickDash(dash: DashStyle): void {
+		this.currentDash = dash;
+		if (this.editingSelection()) this.applyStyle({ dash });
+		this.refreshUi();
+	}
+
+	private pickHeads(heads: ArrowHeads): void {
+		this.currentArrowHeads = heads;
+		if (this.editingSelection()) this.applyStyle({ heads });
+		this.refreshUi();
+	}
+
+	/** The built-in colors followed by the ones the user added. */
+	private paletteColors(): string[] {
+		return COLORS.concat(this.plugin.settings.customColors);
+	}
+
+	/** Adds a color picked with "+" to the palette (if it's new) and uses it. */
+	private async addToPalette(hex: string): Promise<void> {
+		const color = hex.toLowerCase();
+		const settings = this.plugin.settings;
+		if (!this.paletteColors().some((c) => c.toLowerCase() === color)) {
+			settings.customColors = [...settings.customColors, color];
+			await this.plugin.saveSettings();
+		}
+		this.currentColor = color;
+		if (this.editingSelection()) this.applyStyle({ color });
+		this.rebuildPanelSoon();
+	}
+
+	private async removeFromPalette(hex: string): Promise<void> {
+		const color = hex.toLowerCase();
+		const settings = this.plugin.settings;
+		const kept = settings.customColors.filter((c) => c.toLowerCase() !== color);
+		if (kept.length === settings.customColors.length) return;
+		settings.customColors = kept;
+		await this.plugin.saveSettings();
+		if (this.currentColor.toLowerCase() === color) this.currentColor = DEFAULT_COLOR;
+		this.rebuildPanelSoon();
+	}
+
+	/** Rebuilds the style panel on the next tick. Not right away: this runs
+	 * from the color input's own change event, and removing that input
+	 * while the native picker may still be closing can crash some mobile
+	 * WebViews. */
+	private rebuildPanelSoon(): void {
+		window.setTimeout(() => {
+			this.stylePanelKey = "";
+			this.refreshUi();
+		}, 0);
+	}
+
+	private setTool(tool: Tool): void {
+		if (this.textEditor) this.commitTextEditor();
+		this.tool = tool;
+		if (tool !== "laser") this.clearLaser();
+		if (SHAPE_TOOLS.has(tool)) this.lastShapeTool = tool;
+		if (SELECT_TOOLS.has(tool)) this.lastSelectTool = tool;
+		// A selection only lives in the select tools; elsewhere the style
+		// panel is about what you draw next.
+		if (!SELECT_TOOLS.has(tool) && this.selection.size > 0) {
+			this.selection.clear();
+			this.renderSelectionOverlay();
+		}
+		this.applyToolClass();
+		this.refreshUi();
+	}
+
+	private applyToolClass(): void {
+		const wrap = this.canvasWrapEl;
+		for (const cls of Array.from(wrap.classList)) if (cls.startsWith("tool-")) wrap.removeClass(cls);
+		wrap.addClass(`tool-${this.spaceHeld ? "pan" : this.tool}`);
+	}
+
+	/** Applies the shared freehand stroke attributes. Highlight strokes are
+	 * semi-transparent and flagged with data-highlight so they round-trip
+	 * through the saved SVG. */
+	private styleFreehandPath(pathEl: SVGPathElement, color: string, size: number, highlight: boolean, pressure = false): void {
+		if (pressure) {
+			pathEl.setAttribute("fill", color);
+			pathEl.setAttribute("data-size", String(size));
+			return;
+		}
+		pathEl.setAttribute("stroke", color);
+		pathEl.setAttribute("stroke-width", String(size));
+		pathEl.setAttribute("fill", "none");
+		pathEl.setAttribute("stroke-linecap", "round");
+		pathEl.setAttribute("stroke-linejoin", "round");
+		if (highlight) {
+			pathEl.setAttribute("stroke-opacity", String(HIGHLIGHT_OPACITY));
+			pathEl.setAttribute("data-highlight", "true");
+		}
+	}
+
+	/** Highlights always render beneath the ink: they're inserted after the
+	 * last existing highlight but before every other element. Since the
+	 * export copies elementsGroup's children in order, the saved file keeps
+	 * the same layering. */
+	private insertPath(pathEl: SVGPathElement, highlight: boolean): void {
+		if (!highlight) {
+			this.elementsGroup.appendChild(pathEl);
+			return;
+		}
+		const firstInk = Array.from(this.elementsGroup.children).find((c) => !c.hasAttribute("data-highlight") && c.tagName.toLowerCase() !== "image");
+		this.elementsGroup.insertBefore(pathEl, firstInk ?? null);
+	}
+
+	/** Brings the toolbar, the style panel and the zoom label up to date
+	 * after anything that may have changed them. */
+	private refreshUi(): void {
+		if (!this.stylePanelEl) return;
+		this.groupSyncs.forEach((sync) => sync());
+		// The panel is rebuilt only when what it should offer has changed.
+		const panelFor = JSON.stringify([this.styleContext(), this.tool === "text", this.paletteColors().length]);
+		if (panelFor !== this.stylePanelKey) {
+			this.stylePanelKey = panelFor;
+			this.buildStylePanel();
+		}
+		// Controls from an earlier panel are gone from the page; drop them.
+		this.highlighted = this.highlighted.filter(({ el }) => el.isConnected);
+		for (const { el, when } of this.highlighted) el.toggleClass("is-active", when());
+		this.showZoom();
+	}
+
+	private showZoom(): void {
+		this.zoomLabelEl?.setText(`${Math.round(this.zoom * 100)}%`);
+	}
+
+	private toCanvasPoint(evt: { clientX: number; clientY: number }): Point {
+		const pt = this.svgEl.createSVGPoint();
+		pt.x = evt.clientX;
+		pt.y = evt.clientY;
+		const ctm = this.svgEl.getScreenCTM();
+		if (!ctm) return { x: 0, y: 0 };
+		const transformed = pt.matrixTransform(ctm.inverse());
+		return { x: round1(transformed.x), y: round1(transformed.y) };
+	}
+
+	/** Screen-space point relative to the wrapper's own top-left corner --
+	 * the frame all our pan/zoom math is done in. */
+	private toWrapPoint(evt: { clientX: number; clientY: number }): Point {
+		const rect = this.canvasWrapEl.getBoundingClientRect();
+		return { x: evt.clientX - rect.left, y: evt.clientY - rect.top };
+	}
+
+	private onPointerDown = (evt: PointerEvent): void => {
+		const t0 = performance.now();
+		this.handlePointerDown(evt);
+		if (this.diag && evt.pointerType !== "touch") {
+			const d = this.diag;
+			const now = performance.now();
+			d.penDowns++;
+			d.lastDeliveryMs = Math.max(0, t0 - evt.timeStamp);
+			d.maxDeliveryMs = Math.max(d.maxDeliveryMs, d.lastDeliveryMs);
+			d.lastLiftGapMs = d.lastPenUpAt ? evt.timeStamp - d.lastPenUpAt : 0;
+			d.awaitingFirstMove = evt.timeStamp;
+			d.maxDownHandlerMs = Math.max(d.maxDownHandlerMs, now - t0);
+		}
+	};
+
+	private handlePointerDown(evt: PointerEvent): void {
+		if (evt.pointerType === "touch") {
+			this.onTouchStart(evt);
+			return;
+		}
+
+		// Middle/right mouse button always pans, regardless of the active tool.
+		const panButton = evt.button === 1 || evt.button === 2;
+		if (panButton && evt.pointerType === "mouse") {
+			evt.preventDefault();
+			this.beginMousePan(evt);
+			return;
+		}
+		if (evt.pointerType === "mouse" && evt.button !== 0) return;
+
+		if (evt.pointerType === "pen") {
+			this.lastPenActivity = performance.now();
+			// A palm that landed just before the pen shouldn't keep panning.
+			this.cancelTouchGesture();
+		}
+
+		// Never save in the middle of an interaction; onPointerUp reschedules.
+		this.cancelScheduledSave();
+
+		if (this.tool === "pan" || this.spaceHeld) {
+			evt.preventDefault();
+			this.beginMousePan(evt);
+			return;
+		}
+		if (this.tool === "laser") {
+			evt.preventDefault();
+			this.beginLaser(evt);
+			return;
+		}
+		if (this.tool === "eraser") {
+			evt.preventDefault();
+			this.beginErase(evt);
+			return;
+		}
+		if (SELECT_TOOLS.has(this.tool)) {
+			evt.preventDefault();
+			this.beginSelectInteraction(evt);
+			return;
+		}
+		if (SHAPE_TOOLS.has(this.tool)) {
+			evt.preventDefault();
+			this.beginShapeDraw(evt);
+			return;
+		}
+		if (this.tool === "text") {
+			evt.preventDefault();
+			this.beginTextInput(evt);
+			return;
+		}
+
+		// Pencil / highlighter tool: a stylus (Apple Pencil reports as "pen") or a mouse draws.
+		if (this.activeStroke) {
+			// A pointerup/pointercancel was missed for the previous stroke --
+			// a real-world quirk on iPadOS/WebKit where lifting the Apple
+			// Pencil (especially a quick lift-and-retouch, e.g. drawing the
+			// dot of an "i") doesn't always deliver a clean pointerup. Finalize
+			// whatever was drawn so far instead of getting stuck and silently
+			// swallowing every stroke after it.
+			if (this.diag) this.diag.missedPointerUps++;
+			this.finishActiveStroke();
+		}
+		evt.preventDefault();
+		this.canvasWrapEl.setPointerCapture(evt.pointerId);
+		this.checkpoint();
+
+		const p = this.toCanvasPoint(evt);
+		const highlight = this.tool === "highlighter";
+		const pressure = !highlight && evt.pointerType === "pen" && this.plugin.settings.pressure;
+		if (pressure) p.p = penPressure(evt);
+		const color = highlight ? this.currentHighlightColor : this.currentColor;
+		const size = highlight ? this.currentHighlightSize * HIGHLIGHT_SIZE_MULTIPLIER : this.currentSize;
+		const pathEl = document.createElementNS(SVG_NS, "path") as SVGPathElement;
+		this.styleFreehandPath(pathEl, color, size, highlight, pressure);
+		pathEl.setAttribute("d", freehandPathData([p], size, pressure));
+		this.insertPath(pathEl, highlight);
+
+		this.activeStroke = {
+			pathEl,
+			points: [p],
+			pointerId: evt.pointerId,
+			color,
+			size,
+			highlight,
+			pressure,
+		};
+		if (this.tool === "pencil" && this.plugin.settings.shapeRecognition) this.armRecognizer(p);
+	}
+
+	private onPointerMove = (evt: PointerEvent): void => {
+		if (this.diag && this.diag.awaitingFirstMove !== null && evt.pointerType !== "touch") {
+			this.diag.lastDownToMoveMs = evt.timeStamp - this.diag.awaitingFirstMove;
+			this.diag.awaitingFirstMove = null;
+		}
+		if (evt.pointerType === "touch") {
+			this.onTouchMove(evt);
+			return;
+		}
+
+		if (evt.pointerType === "mouse" && evt.buttons === 0) this.updateHoverCursor(evt);
+
+		if (this.panDrag && evt.pointerId === this.panDrag.pointerId) {
+			const p = this.toWrapPoint(evt);
+			this.panX = this.panDrag.startPanX + (p.x - this.panDrag.startWrap.x);
+			this.panY = this.panDrag.startPanY + (p.y - this.panDrag.startWrap.y);
+			this.applyTransform();
+			return;
+		}
+
+		if (this.tool === "laser" && !this.spaceHeld) {
+			this.moveLaser(evt);
+			return;
+		}
+
+		if (this.erasing && evt.pointerId === this.eraseDragPointerId) {
+			this.eraseUnder(evt);
+			return;
+		}
+
+		if (this.selectionDrag && evt.pointerId === this.selectionDrag.pointerId) {
+			this.moveSelection(evt);
+			return;
+		}
+
+		if (this.selectionResize && evt.pointerId === this.selectionResize.pointerId) {
+			this.continueResize(evt);
+			return;
+		}
+
+		if (this.endpointDrag && evt.pointerId === this.endpointDrag.pointerId) {
+			this.continueEndpointDrag(evt);
+			return;
+		}
+
+		if (this.lasso && evt.pointerId === this.lasso.pointerId) {
+			this.lasso.points.push(this.toCanvasPoint(evt));
+			this.renderSelectionOverlay();
+			return;
+		}
+
+		if (this.marquee && evt.pointerId === this.marquee.pointerId) {
+			const p = this.toCanvasPoint(evt);
+			this.marquee.x1 = p.x;
+			this.marquee.y1 = p.y;
+			this.renderSelectionOverlay();
+			return;
+		}
+
+		if (this.activeShapeDraw && evt.pointerId === this.activeShapeDraw.pointerId) {
+			this.updateShapeDraw(evt);
+			return;
+		}
+
+		if (!this.activeStroke || evt.pointerId !== this.activeStroke.pointerId) return;
+		if (evt.pointerType === "pen") this.lastPenActivity = performance.now();
+		const stroke = this.activeStroke;
+		const p = this.toCanvasPoint(evt);
+		const anchor = this.recognizeAnchor;
+		if (anchor && Math.hypot(p.x - anchor.x, p.y - anchor.y) > RECOGNIZE_HOLD_TOLERANCE_PX / this.zoom) this.armRecognizer(p);
+		// Points closer than ~1.2 units to the previous one add nothing to
+		// the line, just weight to the file.
+		const [last] = stroke.points.slice(-1);
+		if (Math.hypot(p.x - last.x, p.y - last.y) < MIN_POINT_GAP) {
+			// Pressing harder in place still changes the width.
+			if (stroke.pressure) last.p = Math.max(last.p ?? 0, penPressure(evt));
+			return;
+		}
+		if (stroke.pressure) p.p = penPressure(evt);
+		stroke.points.push(p);
+		stroke.pathEl.setAttribute("d", freehandPathData(stroke.points, stroke.size, stroke.pressure));
+	};
+
+	/** Resize cursors over the selection handles (mouse only). */
+	private updateHoverCursor(evt: PointerEvent): void {
+		const handle = SELECT_TOOLS.has(this.tool) && this.handles.length > 0 ? this.handleAt(this.toCanvasPoint(evt)) : null;
+		const cursors: Record<HandleId, string> = {
+			nw: "nwse-resize",
+			se: "nwse-resize",
+			ne: "nesw-resize",
+			sw: "nesw-resize",
+			n: "ns-resize",
+			s: "ns-resize",
+			e: "ew-resize",
+			w: "ew-resize",
+			start: "move",
+			end: "move",
+		};
+		const cursor = handle ? cursors[handle] : "";
+		if (this.svgEl.style.cursor !== cursor) this.svgEl.style.cursor = cursor;
+	}
+
+	private onPointerUp = (evt: PointerEvent): void => {
+		const t0 = performance.now();
+		this.handlePointerUp(evt);
+		if (this.diag && evt.pointerType !== "touch") {
+			this.diag.lastPenUpAt = evt.timeStamp;
+			this.diag.maxUpHandlerMs = Math.max(this.diag.maxUpHandlerMs, performance.now() - t0);
+		}
+	};
+
+	private handlePointerUp(evt: PointerEvent): void {
+		if (evt.pointerType === "touch") {
+			this.onTouchEnd(evt);
+			return;
+		}
+		if (evt.pointerType === "pen") this.lastPenActivity = performance.now();
+
+		// Restart the autosave countdown that pointerdown paused (handlers
+		// below that change the drawing reschedule it again anyway).
+		if (this.dirty && !this.saveTimer) this.saveSoon();
+
+		if (this.panDrag && evt.pointerId === this.panDrag.pointerId) {
+			this.releaseCapture(evt.pointerId);
+			this.panDrag = null;
+			return;
+		}
+
+		if (this.laser && evt.pointerId === this.laser.pointerId) {
+			this.releaseCapture(evt.pointerId);
+			this.laser.pointerId = null;
+			// A lifted pencil is gone (unless it hovers again); a mouse stays.
+			if (evt.pointerType !== "mouse" || evt.type === "pointercancel") this.laser.dot = null;
+			this.requestLaserFrame();
+			return;
+		}
+
+		if (this.erasing && evt.pointerId === this.eraseDragPointerId) {
+			this.releaseCapture(evt.pointerId);
+			this.erasing = false;
+			this.eraseDragPointerId = null;
+			return;
+		}
+
+		if (this.selectionDrag && evt.pointerId === this.selectionDrag.pointerId) {
+			const moved = this.selectionDrag.snapshotTaken;
+			this.releaseCapture(evt.pointerId);
+			this.selectionDrag = null;
+			if (moved) this.markDirtyAndScheduleSave();
+			this.renderSelectionOverlay();
+			return;
+		}
+
+		if (this.marquee && evt.pointerId === this.marquee.pointerId) {
+			this.finishMarquee();
+			this.releaseCapture(evt.pointerId);
+			return;
+		}
+
+		if (this.selectionResize && evt.pointerId === this.selectionResize.pointerId) {
+			const moved = this.selectionResize.snapshotTaken;
+			this.releaseCapture(evt.pointerId);
+			this.selectionResize = null;
+			if (moved) this.markDirtyAndScheduleSave();
+			this.renderSelectionOverlay();
+			return;
+		}
+
+		if (this.endpointDrag && evt.pointerId === this.endpointDrag.pointerId) {
+			const moved = this.endpointDrag.snapshotTaken;
+			this.releaseCapture(evt.pointerId);
+			this.endpointDrag = null;
+			this.bindHighlightId = null;
+			if (moved) this.markDirtyAndScheduleSave();
+			this.renderSelectionOverlay();
+			return;
+		}
+
+		if (this.lasso && evt.pointerId === this.lasso.pointerId) {
+			this.commitLasso();
+			this.releaseCapture(evt.pointerId);
+			return;
+		}
+
+		if (this.activeShapeDraw && evt.pointerId === this.activeShapeDraw.pointerId) {
+			this.releaseCapture(evt.pointerId);
+			const { elem, start } = this.activeShapeDraw;
+			const end = this.toCanvasPoint(evt);
+			const tooSmall = Math.hypot(end.x - start.x, end.y - start.y) < 3 / this.zoom;
+			this.activeShapeDraw = null;
+			this.bindHighlightId = null;
+			this.renderSelectionOverlay();
+			if (tooSmall) {
+				this.removeElementDom(elem);
+				this.history.dropLatest(); // a click without a drag drew nothing
+			} else {
+				this.elements.push(elem);
+				this.markDirtyAndScheduleSave();
+			}
+			return;
+		}
+
+		if (!this.activeStroke || evt.pointerId !== this.activeStroke.pointerId) return;
+		this.finishActiveStroke();
+	}
+
+	private finishActiveStroke(): void {
+		this.disarmRecognizer();
+		if (!this.activeStroke) return;
+		this.releaseCapture(this.activeStroke.pointerId);
+		// Simplify once at the end rather than live, so the ink under the pen
+		// behaves exactly as before while drawing.
+		const stroke = this.activeStroke;
+		const points = simplifyPoints(stroke.points, SIMPLIFY_TOLERANCE);
+		const elem: FreehandElement = {
+			id: newElementId(),
+			kind: "freehand",
+			el: stroke.pathEl,
+			points,
+			color: stroke.color,
+			size: stroke.size,
+			highlight: stroke.highlight,
+			pressure: stroke.pressure || undefined,
+		};
+		this.applyGeometry(elem);
+		this.elements.push(elem);
+		this.activeStroke = null;
+		this.markDirtyAndScheduleSave();
+	}
+
+	private releaseCapture(pointerId: number): void {
+		if (this.canvasWrapEl.hasPointerCapture(pointerId)) {
+			this.canvasWrapEl.releasePointerCapture(pointerId);
+		}
+	}
+
+	// --- Pan tool / middle-click pan (mouse or pen) ---
+
+	private beginMousePan(evt: PointerEvent): void {
+		this.canvasWrapEl.setPointerCapture(evt.pointerId);
+		this.panDrag = {
+			pointerId: evt.pointerId,
+			startWrap: this.toWrapPoint(evt),
+			startPanX: this.panX,
+			startPanY: this.panY,
+		};
+	}
+
+	// --- Eraser tool ---
+
+	private beginErase(evt: PointerEvent): void {
+		this.canvasWrapEl.setPointerCapture(evt.pointerId);
+		this.erasing = true;
+		this.eraseDragPointerId = evt.pointerId;
+		this.eraseSnapshotTaken = false;
+		this.eraseUnder(evt);
+	}
+
+	private eraseUnder(evt: PointerEvent): void {
+		const p = this.toCanvasPoint(evt);
+		const radius = ERASE_RADIUS_PX / this.zoom;
+		const hitIdx: number[] = [];
+		for (let i = this.elements.length - 1; i >= 0; i--) {
+			// Images are only removed via select + delete, so erasing ink drawn
+			// over a screenshot never takes the screenshot with it.
+			if (this.elements[i].kind === "image") continue;
+			if (elementHit(this.elements[i], p.x, p.y, radius)) hitIdx.push(i);
+		}
+		if (hitIdx.length === 0) return;
+		// Snapshot lazily, on the first element actually erased in this drag --
+		// a drag that never touches anything shouldn't consume an undo slot.
+		if (!this.eraseSnapshotTaken) {
+			this.checkpoint();
+			this.eraseSnapshotTaken = true;
+		}
+		for (const i of hitIdx) {
+			const elem = this.elements[i];
+			this.removeElementDom(elem);
+			this.elements.splice(i, 1);
+			this.selection.delete(elem.id);
+		}
+		this.updateAllBindings();
+		this.markDirtyAndScheduleSave();
+		this.renderSelectionOverlay();
+	}
+
+	// --- Shape tools (rectangle / ellipse / diamond / arrow) ---
+
+	private beginShapeDraw(evt: PointerEvent): void {
+		this.canvasWrapEl.setPointerCapture(evt.pointerId);
+		this.checkpoint();
+		const p = this.toCanvasPoint(evt);
+		const isLine = this.tool === "line" || this.tool === "arrow";
+		const kind: ShapeKind = isLine ? "arrow" : (this.tool as ShapeKind);
+		const data: ShapeData = { kind, color: this.currentColor, size: this.currentSize, x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+		if (CLOSED_SHAPE_TOOLS.has(this.tool) && this.currentFill !== "none") data.fill = this.currentFill;
+		if (this.currentDash !== "solid") data.dash = this.currentDash;
+		if (isLine) {
+			data.heads = this.tool === "line" ? "none" : this.currentArrowHeads;
+			data.startBind = this.bindTargetAt(p)?.id;
+		}
+		const elem = this.createShapeElement(data);
+		this.activeShapeDraw = { kind, elem, pointerId: evt.pointerId, start: p };
+	}
+
+	/** Drag-to-size for a shape being drawn. Shift makes squares/circles and
+	 * snaps lines to 15-degree steps; a line's end attaches to a shape it's
+	 * dropped on. */
+	private updateShapeDraw(evt: PointerEvent): void {
+		const draw = this.activeShapeDraw;
+		if (!draw) return;
+		const { elem, start } = draw;
+		const p = this.toCanvasPoint(evt);
+		if (elem.kind === "arrow") {
+			const end = evt.shiftKey ? snapAngle(start, p) : p;
+			const target = this.bindTargetAt(end, elem.startBind);
+			elem.endBind = target?.id;
+			this.bindHighlightId = target?.id ?? null;
+			elem.x0 = start.x;
+			elem.y0 = start.y;
+			elem.x1 = end.x;
+			elem.y1 = end.y;
+			this.updateArrowBindings(elem);
+			this.applyGeometry(elem);
+			this.renderSelectionOverlay();
+			return;
+		}
+		let { x, y } = p;
+		if (evt.shiftKey) {
+			const dx = p.x - start.x;
+			const dy = p.y - start.y;
+			const m = Math.max(Math.abs(dx), Math.abs(dy));
+			x = start.x + (dx < 0 ? -m : m);
+			y = start.y + (dy < 0 ? -m : m);
+		}
+		elem.x1 = x;
+		elem.y1 = y;
+		this.applyGeometry(elem);
+	}
+
+	// --- Text tool ---
+
+	private beginTextInput(evt: PointerEvent): void {
+		if (this.textEditor) this.commitTextEditor();
+		const canvasPt = this.toCanvasPoint(evt);
+		const wrapPt = this.toWrapPoint(evt);
+		const fontSize = this.currentSize * TEXT_SIZE_MULTIPLIER;
+
+		const ta = this.canvasWrapEl.createEl("textarea", { cls: "quick-sketch-text-input" });
+		ta.rows = 1;
+		ta.style.left = `${wrapPt.x}px`;
+		ta.style.top = `${wrapPt.y}px`;
+		ta.style.fontSize = `${fontSize * this.zoom}px`;
+		ta.style.color = this.currentColor;
+
+		this.textEditor = ta;
+		this.textEditorCanvasPoint = canvasPt;
+		this.attachTextEditorHandlers(ta);
+	}
+
+	/** Opens the text editor over a shape to edit its label, prefilled with
+	 * the current one. Committing an empty label removes it. */
+	private beginLabelEdit(elem: ShapeElement): void {
+		if (this.textEditor) this.commitTextEditor();
+		const fontSize = elem.labelSize ?? this.currentSize * TEXT_SIZE_MULTIPLIER;
+		const anchor = this.labelAnchor(elem, fontSize);
+
+		const ta = this.canvasWrapEl.createEl("textarea", { cls: "quick-sketch-text-input quick-sketch-label-input" });
+		if (elem.kind === "arrow") ta.addClass("is-arrow");
+		ta.rows = 1;
+		ta.value = elem.label ?? "";
+		ta.style.left = `${anchor.x * this.zoom + this.panX}px`;
+		ta.style.top = `${anchor.y * this.zoom + this.panY}px`;
+		ta.style.fontSize = `${fontSize * this.zoom}px`;
+		ta.style.color = elem.fill === "solid" ? contrastColor(elem.color) : elem.color;
+		if (elem.kind !== "arrow") {
+			// Match the width the label will wrap to inside the shape.
+			ta.style.width = `${Math.max(60, this.labelBox(elem).width * this.zoom)}px`;
+		}
+		// Hide the rendered label while editing so it doesn't show twice.
+		elem.labelEl?.setAttribute("visibility", "hidden");
+
+		this.textEditor = ta;
+		this.textEditorCanvasPoint = anchor;
+		this.textEditorTarget = elem;
+		this.attachTextEditorHandlers(ta);
+		window.setTimeout(() => {
+			ta.style.height = `${ta.scrollHeight}px`;
+			ta.select();
+		}, 0);
+	}
+
+	/** Opens the text editor over an existing text element, prefilled with
+	 * its text. Committing an empty value deletes the element. */
+	private beginTextEdit(elem: TextElement): void {
+		if (this.textEditor) this.commitTextEditor();
+		// The element's y is its first baseline; the editor's top sits about
+		// one line above it (the inverse of the nudge in commitTextEditor).
+		const top = { x: elem.x, y: elem.y - elem.size * 0.8 };
+
+		const ta = this.canvasWrapEl.createEl("textarea", { cls: "quick-sketch-text-input" });
+		ta.rows = 1;
+		ta.value = elem.text;
+		ta.style.left = `${top.x * this.zoom + this.panX}px`;
+		ta.style.top = `${top.y * this.zoom + this.panY}px`;
+		ta.style.fontSize = `${elem.size * this.zoom}px`;
+		ta.style.color = elem.color;
+		// Hide the rendered text while editing so it doesn't show twice.
+		elem.el.setAttribute("visibility", "hidden");
+
+		this.textEditor = ta;
+		this.textEditorCanvasPoint = top;
+		this.textEditorTarget = elem;
+		this.attachTextEditorHandlers(ta);
+		window.setTimeout(() => {
+			ta.style.width = `${Math.max(60, ta.scrollWidth + 2)}px`;
+			ta.style.height = `${ta.scrollHeight}px`;
+			ta.select();
+		}, 0);
+	}
+
+	private attachTextEditorHandlers(ta: HTMLTextAreaElement): void {
+		const autoGrow = () => {
+			ta.style.height = "auto";
+			ta.style.height = `${ta.scrollHeight}px`;
+		};
+		ta.addEventListener("input", autoGrow);
+		ta.addEventListener("keydown", (e) => {
+			e.stopPropagation();
+			if (e.key === "Enter" && !e.shiftKey) {
+				e.preventDefault();
+				this.commitTextEditor();
+			} else if (e.key === "Escape") {
+				e.preventDefault();
+				this.cancelTextEditor();
+			}
+		});
+		ta.addEventListener("blur", () => this.commitTextEditor());
+
+		window.setTimeout(() => ta.focus(), 0);
+	}
+
+	private commitTextEditor(): void {
+		const ta = this.textEditor;
+		const canvasPt = this.textEditorCanvasPoint;
+		if (!ta || !canvasPt) {
+			this.cleanupTextEditor();
+			return;
+		}
+		const value = ta.value.trim();
+		const target = this.textEditorTarget;
+		this.cleanupTextEditor();
+		if (target?.kind === "text") {
+			if (value === target.text) return;
+			this.checkpoint();
+			if (value) {
+				this.setTextContent(target, value);
+				this.updateAllBindings();
+			} else {
+				this.removeElementDom(target);
+				this.elements = this.elements.filter((e) => e !== target);
+				this.selection.delete(target.id);
+			}
+			this.renderSelectionOverlay();
+			this.markDirtyAndScheduleSave();
+			return;
+		}
+		if (target) {
+			if (value === (target.label ?? "")) return;
+			this.checkpoint();
+			this.setShapeLabel(target, value || undefined, target.labelSize ?? this.currentSize * TEXT_SIZE_MULTIPLIER);
+			this.renderSelectionOverlay();
+			this.markDirtyAndScheduleSave();
+			return;
+		}
+		if (!value) return;
+
+		this.checkpoint();
+		const fontSize = this.currentSize * TEXT_SIZE_MULTIPLIER;
+		// SVG text is anchored at its baseline, not its top-left corner; nudge
+		// down roughly one line so the text visually starts near the click.
+		const elem = this.createTextElement(this.currentColor, fontSize, canvasPt.x, canvasPt.y + fontSize * 0.8, value);
+		this.elements.push(elem);
+		this.markDirtyAndScheduleSave();
+	}
+
+	private cancelTextEditor(): void {
+		this.cleanupTextEditor();
+	}
+
+	private cleanupTextEditor(): void {
+		// Clear all editor state *before* removing the textarea: removing a
+		// focused element fires `blur` synchronously, which re-enters
+		// commitTextEditor -- with state still set it would commit a second
+		// time (as a stray free-floating text element).
+		const ta = this.textEditor;
+		const target = this.textEditorTarget;
+		if (target?.kind === "text") target.el.removeAttribute("visibility");
+		else target?.labelEl?.removeAttribute("visibility");
+		this.textEditorTarget = null;
+		this.textEditor = null;
+		this.textEditorCanvasPoint = null;
+		ta?.remove();
+	}
+
+	// --- Select / lasso tools ---
+
+	private hitTest(p: Point): DrawnElement | undefined {
+		const radius = SELECT_HIT_RADIUS_PX / this.zoom;
+		for (let i = this.elements.length - 1; i >= 0; i--) {
+			if (elementHit(this.elements[i], p.x, p.y, radius)) return this.elements[i];
+		}
+		return undefined;
+	}
+
+	private selectionBounds(): Rect | null {
+		return unionRect(this.selectedElements().map(elementBBox));
+	}
+
+	private insideSelectionBounds(p: Point): boolean {
+		const b = this.selection.size > 1 ? this.selectionBounds() : null;
+		if (!b) return false;
+		const pad = 4 / this.zoom;
+		return p.x >= b.x - pad && p.x <= b.x + b.width + pad && p.y >= b.y - pad && p.y <= b.y + b.height + pad;
+	}
+
+	private handleAt(p: Point): HandleId | null {
+		const r = HANDLE_HIT_PX / this.zoom;
+		let best: HandleId | null = null;
+		let bestDist = Infinity;
+		for (const h of this.handles) {
+			const d = Math.hypot(h.x - p.x, h.y - p.y);
+			if (d <= r && d < bestDist) {
+				best = h.id;
+				bestDist = d;
+			}
+		}
+		return best;
+	}
+
+	private beginSelectInteraction(evt: PointerEvent): void {
+		this.canvasWrapEl.setPointerCapture(evt.pointerId);
+		const p = this.toCanvasPoint(evt);
+		const additive = evt.shiftKey;
+
+		// The selection's handles sit on top of everything.
+		const handle = this.selection.size > 0 ? this.handleAt(p) : null;
+		if (handle) {
+			this.beginHandleDrag(evt, handle);
+			return;
+		}
+
+		const hit = this.hitTest(p);
+		if (hit) {
+			const now = performance.now();
+			const tap = this.lastSelectTap;
+			this.lastSelectTap = { id: hit.id, time: now };
+			if (tap && tap.id === hit.id && now - tap.time < DOUBLE_TAP_MS && hit.kind !== "freehand" && hit.kind !== "image" && !additive) {
+				this.lastSelectTap = null;
+				this.releaseCapture(evt.pointerId);
+				this.selectionDrag = null;
+				this.selection.clear();
+				this.selection.add(hit.id);
+				this.renderSelectionOverlay();
+				if (hit.kind === "text") this.beginTextEdit(hit);
+				else this.beginLabelEdit(hit);
+				return;
+			}
+		}
+
+		// Shift+click toggles an element in or out of the selection.
+		if (hit && additive) {
+			if (this.selection.has(hit.id)) this.selection.delete(hit.id);
+			else this.selection.add(hit.id);
+			if (this.selection.has(hit.id)) this.startMovingSelection(evt, p);
+			this.renderSelectionOverlay();
+			return;
+		}
+
+		// Pressing on the selection (or in the gaps of a multi-selection, e.g.
+		// between handwritten letters) moves it; Alt moves a copy.
+		if ((hit && this.selection.has(hit.id)) || this.insideSelectionBounds(p)) {
+			if (evt.altKey) this.duplicateSelection(0);
+			this.startMovingSelection(evt, p, evt.altKey);
+			this.renderSelectionOverlay();
+			return;
+		}
+
+		// The box-select tool picks up what you press on; the lasso always
+		// starts a lasso, so it can be drawn over ink.
+		if (hit && this.tool === "select") {
+			this.selection.clear();
+			this.selection.add(hit.id);
+			if (evt.altKey) this.duplicateSelection(0);
+			this.startMovingSelection(evt, p, evt.altKey);
+			this.renderSelectionOverlay();
+			return;
+		}
+
+		const base = additive ? Array.from(this.selection) : [];
+		if (!additive) this.selection.clear();
+		if (this.tool === "lasso") this.lasso = { pointerId: evt.pointerId, points: [p], base };
+		else this.marquee = { pointerId: evt.pointerId, x0: p.x, y0: p.y, x1: p.x, y1: p.y, base };
+		this.renderSelectionOverlay();
+	}
+
+	private snapshotSelection(): Map<string, GeometrySnapshot> {
+		const original = new Map<string, GeometrySnapshot>();
+		for (const elem of this.elements) {
+			if (!this.selection.has(elem.id)) continue;
+			if (elem.kind === "freehand") {
+				original.set(elem.id, { kind: "freehand", points: elem.points });
+			} else if (elem.kind === "text") {
+				original.set(elem.id, { kind: "text", x: elem.x, y: elem.y, size: elem.size });
+			} else {
+				original.set(elem.id, { kind: "box", x0: elem.x0, y0: elem.y0, x1: elem.x1, y1: elem.y1 });
+			}
+		}
+		return original;
+	}
+
+	private startMovingSelection(evt: PointerEvent, startCanvas: Point, snapshotTaken = false): void {
+		this.selectionDrag = { pointerId: evt.pointerId, startCanvas, original: this.snapshotSelection(), snapshotTaken };
+	}
+
+	/** An arrow moved without the shape it's attached to comes loose. */
+	private detachMovedArrows(): void {
+		for (const elem of this.selectedElements()) {
+			if (elem.kind !== "arrow") continue;
+			if (elem.startBind && !this.selection.has(elem.startBind)) elem.startBind = undefined;
+			if (elem.endBind && !this.selection.has(elem.endBind)) elem.endBind = undefined;
+		}
+	}
+
+	private moveSelection(evt: PointerEvent): void {
+		const drag = this.selectionDrag;
+		if (!drag) return;
+		if (!drag.moved) {
+			drag.moved = true;
+			if (!drag.snapshotTaken) {
+				this.checkpoint();
+				drag.snapshotTaken = true;
+			}
+			this.detachMovedArrows();
+		}
+		const p = this.toCanvasPoint(evt);
+		const dx = p.x - drag.startCanvas.x;
+		const dy = p.y - drag.startCanvas.y;
+		for (const elem of this.elements) {
+			const orig = drag.original.get(elem.id);
+			if (!orig) continue;
+			if (elem.kind === "freehand" && orig.kind === "freehand") {
+				elem.points = orig.points.map((pt) => ({ x: round1(pt.x + dx), y: round1(pt.y + dy), p: pt.p }));
+			} else if (elem.kind === "text" && orig.kind === "text") {
+				elem.x = orig.x + dx;
+				elem.y = orig.y + dy;
+			} else if (orig.kind === "box" && elem.kind !== "freehand" && elem.kind !== "text") {
+				elem.x0 = orig.x0 + dx;
+				elem.y0 = orig.y0 + dy;
+				elem.x1 = orig.x1 + dx;
+				elem.y1 = orig.y1 + dy;
+			}
+			this.applyGeometry(elem);
+		}
+		this.updateAllBindings();
+		this.renderSelectionOverlay();
+	}
+
+	// --- Resize handles ---
+
+	private beginHandleDrag(evt: PointerEvent, handle: HandleId): void {
+		if (handle === "start" || handle === "end") {
+			const elem = this.selectedElements()[0];
+			if (elem?.kind !== "arrow") return;
+			this.endpointDrag = { pointerId: evt.pointerId, elem, end: handle, snapshotTaken: false };
+			return;
+		}
+		const box0 = this.selectionBounds();
+		if (!box0) return;
+		this.selectionResize = { pointerId: evt.pointerId, handle, box0, original: this.snapshotSelection(), snapshotTaken: false };
+	}
+
+	/** Scales the selection from the side/corner opposite the dragged handle.
+	 * Shift on a corner (or a selection of only text) keeps proportions. */
+	private continueResize(evt: PointerEvent): void {
+		const r = this.selectionResize;
+		if (!r) return;
+		if (!r.snapshotTaken) {
+			this.checkpoint();
+			r.snapshotTaken = true;
+		}
+		const p = this.toCanvasPoint(evt);
+		const b = r.box0;
+		const h = r.handle;
+		const min = 4 / this.zoom;
+		let x0 = b.x;
+		let y0 = b.y;
+		let x1 = b.x + b.width;
+		let y1 = b.y + b.height;
+		if (h.includes("w")) x0 = Math.min(p.x, x1 - min);
+		if (h.includes("e")) x1 = Math.max(p.x, x0 + min);
+		if (h.includes("n")) y0 = Math.min(p.y, y1 - min);
+		if (h.includes("s")) y1 = Math.max(p.y, y0 + min);
+		let sx = b.width > 0 ? (x1 - x0) / b.width : 1;
+		let sy = b.height > 0 ? (y1 - y0) / b.height : 1;
+		const corner = h.length === 2;
+		const keepAspect = this.selectedElements().every((e) => e.kind === "text" || e.kind === "image");
+		if (corner && (evt.shiftKey || keepAspect)) {
+			const s = Math.max(sx, sy);
+			sx = sy = s;
+			if (h.includes("w")) x0 = x1 - b.width * s;
+			else x1 = x0 + b.width * s;
+			if (h.includes("n")) y0 = y1 - b.height * s;
+			else y1 = y0 + b.height * s;
+		}
+		const mx = (x: number) => round1(x0 + (x - b.x) * sx);
+		const my = (y: number) => round1(y0 + (y - b.y) * sy);
+		const textScale = corner ? Math.sqrt(sx * sy) : h === "n" || h === "s" ? sy : sx;
+
+		for (const elem of this.elements) {
+			const orig = r.original.get(elem.id);
+			if (!orig) continue;
+			if (elem.kind === "freehand" && orig.kind === "freehand") {
+				elem.points = orig.points.map((pt) => ({ x: mx(pt.x), y: my(pt.y), p: pt.p }));
+			} else if (elem.kind === "text" && orig.kind === "text") {
+				elem.size = Math.max(4, round1(orig.size * textScale));
+				// Scale about the text's top edge, not its baseline.
+				elem.x = mx(orig.x);
+				elem.y = round1(my(orig.y - orig.size * 0.8) + elem.size * 0.8);
+			} else if (orig.kind === "box" && elem.kind !== "freehand" && elem.kind !== "text") {
+				elem.x0 = mx(orig.x0);
+				elem.y0 = my(orig.y0);
+				elem.x1 = mx(orig.x1);
+				elem.y1 = my(orig.y1);
+			}
+			this.applyGeometry(elem);
+		}
+		this.updateAllBindings();
+		this.renderSelectionOverlay();
+	}
+
+	/** Dragging one end of a lone selected line/arrow; it attaches to a
+	 * shape it's dropped on, and Shift snaps its angle. */
+	private continueEndpointDrag(evt: PointerEvent): void {
+		const d = this.endpointDrag;
+		if (!d) return;
+		if (!d.snapshotTaken) {
+			this.checkpoint();
+			d.snapshotTaken = true;
+		}
+		const elem = d.elem;
+		let p = this.toCanvasPoint(evt);
+		const other = d.end === "start" ? { x: elem.x1, y: elem.y1 } : { x: elem.x0, y: elem.y0 };
+		if (evt.shiftKey) p = snapAngle(other, p);
+		const target = this.bindTargetAt(p, d.end === "start" ? elem.endBind : elem.startBind);
+		if (d.end === "start") {
+			elem.startBind = target?.id;
+			elem.x0 = p.x;
+			elem.y0 = p.y;
+		} else {
+			elem.endBind = target?.id;
+			elem.x1 = p.x;
+			elem.y1 = p.y;
+		}
+		this.bindHighlightId = target?.id ?? null;
+		this.updateArrowBindings(elem);
+		this.applyGeometry(elem);
+		this.renderSelectionOverlay();
+	}
+
+	/** Selects what the finished marquee touches, added to what was
+	 * selected before when Shift was held. */
+	private finishMarquee(): void {
+		const m = this.marquee;
+		if (!m) return;
+		this.marquee = null;
+		const area = boxAround([
+			{ x: m.x0, y: m.y0 },
+			{ x: m.x1, y: m.y1 },
+		]) as Box;
+		const picked = new Set(m.base);
+		// A plain click (no real drag) selects nothing new.
+		if (area.right - area.left > 2 && area.bottom - area.top > 2) {
+			for (const elem of this.elements) if (boxesTouch(area, boxOfRect(elementBBox(elem)))) picked.add(elem.id);
+		}
+		this.selection = picked;
+		this.renderSelectionOverlay();
+	}
+
+	/** Selects everything mostly (at least half) inside the lasso. */
+	private commitLasso(): void {
+		const lasso = this.lasso;
+		if (!lasso) return;
+		this.lasso = null;
+		this.selection = new Set(lasso.base);
+		const poly = lasso.points;
+		if (poly.length >= 3) {
+			for (const elem of this.elements) {
+				const samples = this.samplePoints(elem);
+				const inside = samples.filter((s) => pointInPolygon(s.x, s.y, poly)).length;
+				if (samples.length > 0 && inside / samples.length >= 0.5) this.selection.add(elem.id);
+			}
+		}
+		this.renderSelectionOverlay();
+	}
+
+	private samplePoints(elem: DrawnElement): Point[] {
+		if (elem.kind === "freehand") return elem.points;
+		if (elem.kind === "arrow") {
+			return [
+				{ x: elem.x0, y: elem.y0 },
+				{ x: (elem.x0 + elem.x1) / 2, y: (elem.y0 + elem.y1) / 2 },
+				{ x: elem.x1, y: elem.y1 },
+			];
+		}
+		const b = elementBBox(elem);
+		const pts: Point[] = [];
+		for (const fx of [0, 0.5, 1]) for (const fy of [0, 0.5, 1]) pts.push({ x: b.x + b.width * fx, y: b.y + b.height * fy });
+		return pts;
+	}
+
+	private renderSelectionOverlay(): void {
+		this.overlayGroup.replaceChildren();
+		this.handles = [];
+		const z = this.zoom;
+		const add = (tag: string, attrs: Record<string, string | number>, cls: string): SVGElement => {
+			const el = document.createElementNS(SVG_NS, tag) as SVGElement;
+			for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+			el.classList.add(cls);
+			this.overlayGroup.appendChild(el);
+			return el;
+		};
+
+		if (this.marquee) {
+			const { x0, y0, x1, y1 } = this.marquee;
+			add("rect", { x: Math.min(x0, x1), y: Math.min(y0, y1), width: Math.abs(x1 - x0), height: Math.abs(y1 - y0) }, "quick-sketch-rubberband");
+		}
+		if (this.lasso) {
+			add("path", { d: "M" + this.lasso.points.map((pt) => `${pt.x} ${pt.y}`).join("L") + "Z" }, "quick-sketch-rubberband");
+		}
+
+		const target = this.findElement(this.bindHighlightId ?? undefined);
+		if (target && isBindable(target)) {
+			const b = this.bindBox(target);
+			const pad = 6 / z;
+			add("rect", { x: b.x - pad, y: b.y - pad, width: b.width + pad * 2, height: b.height + pad * 2, rx: 4 / z }, "qs-bind-highlight");
+		}
+
+		const sel = this.selectedElements();
+		if (sel.length > 0) {
+			const pad = 4 / z;
+			const boxes = sel.map(elementBBox);
+			if (sel.length > 1) {
+				for (const b of boxes) {
+					add("rect", { x: b.x - pad, y: b.y - pad, width: b.width + pad * 2, height: b.height + pad * 2 }, "quick-sketch-selection-rect");
+				}
+			}
+			const hs = HANDLE_SIZE_PX / z;
+			const handle = (id: HandleId, x: number, y: number, round: boolean) => {
+				this.handles.push({ id, x, y });
+				if (round) add("circle", { cx: x, cy: y, r: hs / 2 }, "qs-handle");
+				else add("rect", { x: x - hs / 2, y: y - hs / 2, width: hs, height: hs, rx: 2 / z }, "qs-handle");
+			};
+			const single = sel.length === 1 ? sel[0] : null;
+			if (single?.kind === "arrow") {
+				add("line", { x1: single.x0, y1: single.y0, x2: single.x1, y2: single.y1 }, "quick-sketch-selection-rect");
+				handle("start", single.x0, single.y0, true);
+				handle("end", single.x1, single.y1, true);
+			} else {
+				const u = unionRect(boxes) as Rect;
+				const x0 = u.x - pad;
+				const y0 = u.y - pad;
+				const x1 = u.x + u.width + pad;
+				const y1 = u.y + u.height + pad;
+				add("rect", { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }, "qs-selection-box");
+				const mx = (x0 + x1) / 2;
+				const my = (y0 + y1) / 2;
+				handle("nw", x0, y0, false);
+				handle("ne", x1, y0, false);
+				handle("se", x1, y1, false);
+				handle("sw", x0, y1, false);
+				// Side handles only when there's room for them between the
+				// corners, and not for text (which only scales uniformly).
+				const textOnly = sel.every((e) => e.kind === "text");
+				if (!textOnly && (x1 - x0) * z > 48) {
+					handle("n", mx, y0, false);
+					handle("s", mx, y1, false);
+				}
+				if (!textOnly && (y1 - y0) * z > 48) {
+					handle("e", x1, my, false);
+					handle("w", x0, my, false);
+				}
+			}
+		}
+
+		this.refreshUi();
+	}
+
+	private selectAll(): void {
+		if (!SELECT_TOOLS.has(this.tool)) this.setTool("select");
+		this.selection = new Set(this.elements.map((e) => e.id));
+		this.renderSelectionOverlay();
+	}
+
+	private deleteSelected(): void {
+		if (this.selection.size === 0) return;
+		this.checkpoint();
+		const [gone, kept] = [this.elements.filter((e) => this.selection.has(e.id)), this.elements.filter((e) => !this.selection.has(e.id))];
+		gone.forEach((e) => this.removeElementDom(e));
+		this.elements = kept;
+		this.selection.clear();
+		this.updateAllBindings();
+		this.renderSelectionOverlay();
+		this.markDirtyAndScheduleSave();
+	}
+
+	/** Moves the selection by (dx, dy). Rapid repeats share one undo step. */
+	private nudgeSelection(dx: number, dy: number): void {
+		if (this.selection.size === 0) return;
+		const now = performance.now();
+		if (now - this.lastNudgeAt > 800) this.checkpoint();
+		this.lastNudgeAt = now;
+		this.detachMovedArrows();
+		for (const elem of this.selectedElements()) {
+			if (elem.kind === "freehand") {
+				elem.points = elem.points.map((pt) => ({ x: round1(pt.x + dx), y: round1(pt.y + dy), p: pt.p }));
+			} else if (elem.kind === "text") {
+				elem.x += dx;
+				elem.y += dy;
+			} else {
+				elem.x0 += dx;
+				elem.y0 += dy;
+				elem.x1 += dx;
+				elem.y1 += dy;
+			}
+			this.applyGeometry(elem);
+		}
+		this.updateAllBindings();
+		this.renderSelectionOverlay();
+		this.markDirtyAndScheduleSave();
+	}
+
+	// --- Copy / paste / duplicate ---
+
+	private copySelection(): void {
+		if (this.selection.size === 0) return;
+		clipboard = this.cloneElements().filter((s) => this.selection.has(s.id));
+		this.pasteCount = 0;
+	}
+
+	private cutSelection(): void {
+		this.copySelection();
+		this.deleteSelected();
+	}
+
+	private paste(): void {
+		if (clipboard.length === 0) return;
+		this.pasteCount++;
+		this.insertCopies(clipboard, PASTE_OFFSET * this.pasteCount);
+	}
+
+	private duplicateSelection(offset = PASTE_OFFSET): void {
+		if (this.selection.size === 0) return;
+		this.insertCopies(
+			this.cloneElements().filter((s) => this.selection.has(s.id)),
+			offset
+		);
+	}
+
+	/** Adds copies of `items` (with new ids, shifted by `offset`) on top and
+	 * selects them. Arrows stay attached only to shapes copied with them. */
+	private insertCopies(items: SerializedElement[], offset: number): void {
+		if (this.textEditor) this.commitTextEditor();
+		this.checkpoint();
+		const ids = new Map(items.map((s) => [s.id, newElementId()]));
+		const created = items.map((s) => {
+			const copy = offsetSerialized(s, offset, offset);
+			copy.id = ids.get(s.id) as string;
+			if (copy.kind !== "freehand" && copy.kind !== "text") {
+				copy.startBind = copy.startBind ? ids.get(copy.startBind) : undefined;
+				copy.endBind = copy.endBind ? ids.get(copy.endBind) : undefined;
+			}
+			return this.createFromSerialized(copy);
+		});
+		this.elements.push(...created);
+		this.imagesFirst();
+		if (!SELECT_TOOLS.has(this.tool)) this.setTool("select");
+		this.selection = new Set(created.map((e) => e.id));
+		this.updateAllBindings();
+		this.renderSelectionOverlay();
+		this.markDirtyAndScheduleSave();
+	}
+
+	// --- Restyling the selection ---
+
+	private applyStyle(patch: { color?: string; sizePx?: number; fill?: FillStyle; heads?: ArrowHeads; dash?: DashStyle }): void {
+		const sel = this.selectedElements();
+		if (sel.length === 0) return;
+		this.checkpoint();
+		const snaps = new Map(this.cloneElements().map((s) => [s.id, s]));
+		for (const elem of sel) {
+			const s = snaps.get(elem.id);
+			if (!s) continue;
+			if (s.kind === "image") continue;
+			if (patch.color) s.color = patch.color;
+			if (patch.sizePx !== undefined) {
+				const px = patch.sizePx;
+				if (s.kind === "freehand") s.size = s.highlight ? px * HIGHLIGHT_SIZE_MULTIPLIER : px;
+				else if (s.kind === "text") s.size = px * TEXT_SIZE_MULTIPLIER;
+				else {
+					s.size = px;
+					if (s.label) s.labelSize = px * TEXT_SIZE_MULTIPLIER;
+				}
+			}
+			if (patch.fill && s.kind !== "freehand" && s.kind !== "text" && s.kind !== "arrow") {
+				s.fill = patch.fill === "none" ? undefined : patch.fill;
+			}
+			if (patch.heads && s.kind === "arrow") s.heads = patch.heads;
+			if (patch.dash && s.kind !== "freehand" && s.kind !== "text") {
+				s.dash = patch.dash === "solid" ? undefined : patch.dash;
+			}
+			this.replaceElement(elem, s);
+		}
+		this.updateAllBindings();
+		this.renderSelectionOverlay();
+		this.markDirtyAndScheduleSave();
+	}
+
+	/** Swaps an element for a freshly built one, keeping its stacking place. */
+	private replaceElement(old: DrawnElement, s: SerializedElement): DrawnElement {
+		const fresh = this.createFromSerialized(s);
+		rootNode(old).replaceWith(rootNode(fresh));
+		const i = this.elements.indexOf(old);
+		if (i >= 0) this.elements[i] = fresh;
+		return fresh;
+	}
+
+	// --- Arrows attached to shapes ---
+
+	private findElement(id?: string): DrawnElement | undefined {
+		return id ? this.elements.find((e) => e.id === id) : undefined;
+	}
+
+	/** Topmost shape or text an arrow end at `p` would attach to. */
+	private bindTargetAt(p: Point, exclude?: string): ShapeElement | TextElement | undefined {
+		const tol = BIND_DISTANCE_PX / this.zoom;
+		for (let i = this.elements.length - 1; i >= 0; i--) {
+			const e = this.elements[i];
+			if (e.id === exclude || !isBindable(e)) continue;
+			const b = this.bindBox(e);
+			if (p.x >= b.x - tol && p.x <= b.x + b.width + tol && p.y >= b.y - tol && p.y <= b.y + b.height + tol) return e;
+		}
+		return undefined;
+	}
+
+	private bindBox(e: ShapeElement | TextElement): Rect {
+		if (e.kind === "text") {
+			const b = e.el.getBBox();
+			return { x: b.x, y: b.y, width: b.width, height: b.height };
+		}
+		return { x: Math.min(e.x0, e.x1), y: Math.min(e.y0, e.y1), width: Math.abs(e.x1 - e.x0), height: Math.abs(e.y1 - e.y0) };
+	}
+
+	/** Where the line from `target`'s center toward `toward` leaves its
+	 * outline, pushed out by `gap`. */
+	private boundaryPoint(target: ShapeElement | TextElement, toward: Point, gap: number): Point {
+		const b = this.bindBox(target);
+		const cx = b.x + b.width / 2;
+		const cy = b.y + b.height / 2;
+		const hw = b.width / 2;
+		const hh = b.height / 2;
+		const dx = toward.x - cx;
+		const dy = toward.y - cy;
+		const len = Math.hypot(dx, dy);
+		if (len < 1e-6 || hw <= 0 || hh <= 0) return { x: cx, y: cy };
+		let t: number;
+		if (target.kind === "ellipse") t = 1 / Math.hypot(dx / hw, dy / hh);
+		else if (target.kind === "diamond") t = 1 / (Math.abs(dx) / hw + Math.abs(dy) / hh);
+		else t = 1 / Math.max(Math.abs(dx) / hw, Math.abs(dy) / hh);
+		const k = t + gap / len;
+		return { x: round1(cx + dx * k), y: round1(cy + dy * k) };
+	}
+
+	/** Re-aims an arrow's attached end(s) at their shapes: each attached end
+	 * sits on its shape's outline, on the line toward the other end (or the
+	 * other shape's center, when both ends are attached). */
+	private updateArrowBindings(elem: ShapeElement): void {
+		const find = (id?: string) => {
+			const e = this.findElement(id);
+			return e && isBindable(e) ? e : undefined;
+		};
+		const s = find(elem.startBind);
+		const e = find(elem.endBind);
+		if (!s) elem.startBind = undefined;
+		if (!e) elem.endBind = undefined;
+		if (!s && !e) return;
+		const center = (t: ShapeElement | TextElement) => {
+			const b = this.bindBox(t);
+			return { x: b.x + b.width / 2, y: b.y + b.height / 2 };
+		};
+		const gap = (t: ShapeElement | TextElement) => 3 + elem.size / 2 + (t.kind === "text" ? 0 : t.size / 2);
+		const startRef = e ? center(e) : { x: elem.x1, y: elem.y1 };
+		const endRef = s ? center(s) : { x: elem.x0, y: elem.y0 };
+		if (s) {
+			const q = this.boundaryPoint(s, startRef, gap(s));
+			elem.x0 = q.x;
+			elem.y0 = q.y;
+		}
+		if (e) {
+			const q = this.boundaryPoint(e, endRef, gap(e));
+			elem.x1 = q.x;
+			elem.y1 = q.y;
+		}
+	}
+
+	/** Brings every attached arrow up to date with its shapes (and lets go
+	 * of shapes that no longer exist). */
+	private updateAllBindings(): void {
+		for (const elem of this.elements) {
+			if (elem.kind !== "arrow" || (!elem.startBind && !elem.endBind)) continue;
+			this.updateArrowBindings(elem);
+			this.applyGeometry(elem);
+		}
+	}
+
+	// --- Laser pointer (for presenting) ---
+
+	private ensureLaser(): LaserState | null {
+		if (this.laser) return this.laser;
+		const canvas = this.canvasWrapEl.createEl("canvas", { cls: "qs-laser-canvas" });
+		const ctx = canvas.getContext("2d");
+		if (!ctx) {
+			canvas.remove();
+			return null;
+		}
+		this.laser = { canvas, ctx, trails: [], pointerId: null, dot: null, rafId: null };
+		return this.laser;
+	}
+
+	private beginLaser(evt: PointerEvent): void {
+		const laser = this.ensureLaser();
+		if (!laser) return;
+		if (evt.pointerType === "pen") this.lastPenActivity = performance.now();
+		this.canvasWrapEl.setPointerCapture(evt.pointerId);
+		const p = this.toWrapPoint(evt);
+		const now = performance.now();
+		// "Hold" trails stay until the next stroke starts; then they fade.
+		for (const trail of laser.trails) if (trail.fadeFrom === null) trail.fadeFrom = now;
+		laser.pointerId = evt.pointerId;
+		laser.dot = p;
+		laser.trails.push({ points: [{ x: p.x, y: p.y, t: now }], fadeFrom: null });
+		this.requestLaserFrame();
+	}
+
+	/** Pressed: extend the trail. Hovering (mouse, or a pencil that supports
+	 * hover): just move the dot. */
+	private moveLaser(evt: PointerEvent): void {
+		const laser = this.ensureLaser();
+		if (!laser) return;
+		if (laser.pointerId !== null && evt.pointerId !== laser.pointerId) return;
+		const p = this.toWrapPoint(evt);
+		laser.dot = p;
+		if (laser.pointerId !== null) {
+			if (evt.pointerType === "pen") this.lastPenActivity = performance.now();
+			// Coalesced events give a smoother trail from fast pen movement.
+			const events = typeof evt.getCoalescedEvents === "function" ? evt.getCoalescedEvents() : [];
+			const trail = laser.trails[laser.trails.length - 1];
+			const now = performance.now();
+			for (const e of events.length > 0 ? events : [evt]) {
+				const q = this.toWrapPoint(e);
+				trail.points.push({ x: q.x, y: q.y, t: now });
+			}
+		}
+		this.requestLaserFrame();
+	}
+
+	private onPointerLeave = (evt: PointerEvent): void => {
+		if (!this.laser || evt.pointerType === "touch" || this.laser.pointerId !== null) return;
+		this.laser.dot = null;
+		this.requestLaserFrame();
+	};
+
+	/** Fades out every trail (Escape, or "hold" trails on demand). */
+	private fadeLaserTrails(): void {
+		const laser = this.laser;
+		if (!laser) return;
+		const now = performance.now();
+		for (const trail of laser.trails) if (trail.fadeFrom === null) trail.fadeFrom = now;
+		this.requestLaserFrame();
+	}
+
+	private requestLaserFrame(): void {
+		const laser = this.laser;
+		if (!laser || laser.rafId !== null) return;
+		laser.rafId = requestAnimationFrame(() => {
+			laser.rafId = null;
+			this.drawLaser();
+		});
+	}
+
+	/** Redraws the dot and the trails; keeps animating while any trail is
+	 * still fading. */
+	private drawLaser(): void {
+		const laser = this.laser;
+		if (!laser) return;
+		const { canvas, ctx } = laser;
+		const dpr = window.devicePixelRatio || 1;
+		const w = this.canvasWrapEl.clientWidth;
+		const h = this.canvasWrapEl.clientHeight;
+		if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+			canvas.width = Math.round(w * dpr);
+			canvas.height = Math.round(h * dpr);
+		}
+		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		ctx.clearRect(0, 0, w, h);
+
+		const rgb = hexToRgb(this.plugin.settings.laserColor) ?? "255, 40, 40";
+		const mode = this.plugin.settings.laserTrail;
+		const fadeMs = LASER_TRAIL_MS[mode];
+		const now = performance.now();
+		let animating = false;
+
+		// Expire what has faded. A trail being drawn keeps its newest point
+		// so the dot stays attached to it while the pointer rests.
+		laser.trails = laser.trails.filter((trail, i) => {
+			const live = laser.pointerId !== null && i === laser.trails.length - 1;
+			if (trail.fadeFrom !== null) return now - trail.fadeFrom < LASER_HOLD_FADE_MS;
+			if (mode === "hold") return true;
+			const kept = trail.points.filter((pt) => now - pt.t < fadeMs);
+			if (live && kept.length === 0) kept.push({ ...trail.points[trail.points.length - 1], t: now });
+			trail.points = kept;
+			return kept.length > 0;
+		});
+
+		ctx.lineCap = "round";
+		ctx.lineJoin = "round";
+		for (const trail of laser.trails) {
+			// A whole trail fading out (after "hold", or Escape)...
+			const trailLife = trail.fadeFrom === null ? 1 : 1 - (now - trail.fadeFrom) / LASER_HOLD_FADE_MS;
+			if (trail.fadeFrom !== null) animating = true;
+			const pts = trail.points;
+			for (let i = 1; i < pts.length; i++) {
+				// ...and, while fading by age, its tail thinning out behind it.
+				const age = mode === "hold" || trail.fadeFrom !== null ? 0 : (now - pts[i].t) / fadeMs;
+				const life = Math.min(trailLife, 1 - age);
+				if (life <= 0) continue;
+				if (age > 0) animating = true;
+				ctx.beginPath();
+				ctx.moveTo(pts[i - 1].x, pts[i - 1].y);
+				ctx.lineTo(pts[i].x, pts[i].y);
+				// Soft glow, then a bright core.
+				ctx.strokeStyle = `rgba(${rgb}, ${0.25 * life})`;
+				ctx.lineWidth = LASER_WIDTH_PX * 2.6 * life;
+				ctx.stroke();
+				ctx.strokeStyle = `rgba(${rgb}, ${life})`;
+				ctx.lineWidth = LASER_WIDTH_PX * life;
+				ctx.stroke();
+			}
+		}
+
+		if (laser.dot) {
+			const { x, y } = laser.dot;
+			const glow = ctx.createRadialGradient(x, y, 0, x, y, LASER_WIDTH_PX * 2.5);
+			glow.addColorStop(0, `rgba(${rgb}, 0.55)`);
+			glow.addColorStop(1, `rgba(${rgb}, 0)`);
+			ctx.fillStyle = glow;
+			ctx.beginPath();
+			ctx.arc(x, y, LASER_WIDTH_PX * 2.5, 0, Math.PI * 2);
+			ctx.fill();
+			ctx.fillStyle = `rgb(${rgb})`;
+			ctx.beginPath();
+			ctx.arc(x, y, LASER_WIDTH_PX * 0.8, 0, Math.PI * 2);
+			ctx.fill();
+			ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+			ctx.beginPath();
+			ctx.arc(x, y, LASER_WIDTH_PX * 0.35, 0, Math.PI * 2);
+			ctx.fill();
+		}
+
+		if (animating) this.requestLaserFrame();
+	}
+
+	/** Removes the laser overlay entirely (on leaving the tool / closing). */
+	private clearLaser(): void {
+		const laser = this.laser;
+		if (!laser) return;
+		if (laser.rafId !== null) cancelAnimationFrame(laser.rafId);
+		if (laser.pointerId !== null) this.releaseCapture(laser.pointerId);
+		laser.canvas.remove();
+		this.laser = null;
+	}
+
+	// --- Touch: pan with one finger, pinch-zoom with two. Never draws. ---
+
+	private onTouchStart(evt: PointerEvent): void {
+		evt.preventDefault();
+		const penBusy =
+			this.activeStroke !== null ||
+			performance.now() - this.lastPenActivity < PALM_GUARD_MS;
+		if (penBusy || this.touchPoints.size >= 2) {
+			// Palm while writing (or a 3rd+ finger): ignore entirely.
+			if (this.diag) this.diag.touchesRejected++;
+			return;
+		}
+		if (this.diag) this.diag.touchesAccepted++;
+		this.canvasWrapEl.setPointerCapture(evt.pointerId);
+		this.touchPoints.set(evt.pointerId, this.toWrapPoint(evt));
+	}
+
+	private onTouchMove(evt: PointerEvent): void {
+		const prev = this.touchPoints.get(evt.pointerId);
+		if (!prev) return;
+		evt.preventDefault();
+		const next = this.toWrapPoint(evt);
+
+		const otherEntry = Array.from(this.touchPoints.entries()).find(([id]) => id !== evt.pointerId);
+		if (!otherEntry) {
+			// One finger: pan (pan is applied post-scale, so screen deltas map 1:1).
+			this.panX += next.x - prev.x;
+			this.panY += next.y - prev.y;
+		} else {
+			// Two fingers: pinch-zoom anchored at the previous midpoint, then
+			// carry the midpoint's own movement as an additional pan.
+			const other = otherEntry[1];
+			const prevMid = { x: (prev.x + other.x) / 2, y: (prev.y + other.y) / 2 };
+			const prevDist = Math.hypot(prev.x - other.x, prev.y - other.y);
+			const nextMid = { x: (next.x + other.x) / 2, y: (next.y + other.y) / 2 };
+			const nextDist = Math.hypot(next.x - other.x, next.y - other.y);
+
+			if (prevDist > 0) this.zoomAt(prevMid.x, prevMid.y, this.zoom * (nextDist / prevDist));
+			this.panX += nextMid.x - prevMid.x;
+			this.panY += nextMid.y - prevMid.y;
+		}
+
+		this.touchPoints.set(evt.pointerId, next);
+		this.applyTransform();
+	}
+
+	private cancelTouchGesture(): void {
+		for (const id of this.touchPoints.keys()) this.releaseCapture(id);
+		this.touchPoints.clear();
+	}
+
+	private onTouchEnd(evt: PointerEvent): void {
+		this.touchPoints.delete(evt.pointerId);
+		if (this.canvasWrapEl.hasPointerCapture(evt.pointerId)) {
+			this.canvasWrapEl.releasePointerCapture(evt.pointerId);
+		}
+	}
+
+	// --- Desktop trackpad/wheel: plain scroll pans, ctrl/cmd+scroll (pinch) zooms. ---
+
+	private onWheel = (evt: WheelEvent): void => {
+		evt.preventDefault();
+		if (evt.ctrlKey || evt.metaKey) {
+			const { x, y } = this.toWrapPoint(evt);
+			this.zoomAt(x, y, this.zoom * Math.exp(-evt.deltaY * 0.01));
+		} else {
+			this.panX -= evt.deltaX;
+			this.panY -= evt.deltaY;
+		}
+		this.applyTransform();
+	};
+
+	/** Rescales, keeping the content under the given wrapper-relative screen
+	 * point (e.g. a pinch midpoint or the cursor) visually fixed in place. */
+	private zoomAt(screenX: number, screenY: number, newZoom: number): void {
+		const clamped = clampZoom(newZoom);
+		const localX = (screenX - this.panX) / this.zoom;
+		const localY = (screenY - this.panY) / this.zoom;
+		this.zoom = clamped;
+		this.panX = screenX - localX * clamped;
+		this.panY = screenY - localY * clamped;
+	}
+
+	/** Zooms in or out by `factor`, keeping the middle of the view still. */
+	private zoomBy(factor: number): void {
+		const wrap = this.canvasWrapEl;
+		this.zoomAt(wrap.clientWidth / 2, wrap.clientHeight / 2, this.zoom * factor);
+		this.applyTransform();
+	}
+
+	/** Zooms and pans so the whole drawing fills the view, with a margin. */
+	private fitToContent(): void {
+		if (this.elements.length === 0) return this.centerView();
+		const content = this.elementsGroup.getBBox();
+		const viewW = this.canvasWrapEl.clientWidth;
+		const viewH = this.canvasWrapEl.clientHeight;
+		const margin = 40;
+		const fit = Math.min((viewW - 2 * margin) / Math.max(1, content.width), (viewH - 2 * margin) / Math.max(1, content.height));
+		this.zoom = clampZoom(fit);
+		this.panX = viewW / 2 - (content.x + content.width / 2) * this.zoom;
+		this.panY = viewH / 2 - (content.y + content.height / 2) * this.zoom;
+		this.applyTransform();
+	}
+
+	private applyTransform(): void {
+		this.svgEl.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+		// Handles keep a constant on-screen size, so they're redrawn on zoom.
+		if (this.selection.size > 0) this.renderSelectionOverlay();
+		this.showZoom();
+	}
+
+	// --- Undo / redo ---
+
+	/** Call just before changing the drawing, so undo can come back here. */
+	private checkpoint(): void {
+		this.history.record(this.cloneElements());
+	}
+
+	private cloneElements(): SerializedElement[] {
+		return this.elements.map((elem) => {
+			if (elem.kind === "freehand") {
+				// Points arrays are never mutated in place once an element is
+				// finalized (a selection drag reassigns a brand-new array rather
+				// than pushing into this one), so sharing the reference is safe
+				// and avoids an O(total points ever drawn) deep clone on every
+				// single pointerdown -- with a lot of handwritten strokes on
+				// screen, that clone was slow enough to be felt as input lag
+				// (e.g. the dot of an "i" not registering right after its stem).
+				return {
+					id: elem.id,
+					kind: "freehand",
+					color: elem.color,
+					size: elem.size,
+					points: elem.points,
+					highlight: elem.highlight,
+					pressure: elem.pressure,
+				};
+			}
+			if (elem.kind === "text") {
+				return {
+					id: elem.id,
+					kind: "text",
+					color: elem.color,
+					size: elem.size,
+					x: elem.x,
+					y: elem.y,
+					text: elem.text,
+				};
+			}
+			return {
+				id: elem.id,
+				kind: elem.kind,
+				color: elem.color,
+				size: elem.size,
+				x0: elem.x0,
+				y0: elem.y0,
+				x1: elem.x1,
+				y1: elem.y1,
+				label: elem.label,
+				labelSize: elem.labelSize,
+				fill: elem.fill,
+				heads: elem.heads,
+				startBind: elem.startBind,
+				endBind: elem.endBind,
+				dash: elem.dash,
+				href: elem.href,
+			};
+		});
+	}
+
+	private createFromSerialized(s: SerializedElement): DrawnElement {
+		if (s.kind === "freehand") return this.createFreehandElement(s.color, s.size, s.points, s.id, s.highlight);
+		if (s.kind === "text") return this.createTextElement(s.color, s.size, s.x, s.y, s.text, s.id);
+		const { id, ...data } = s;
+		return this.createShapeElement(data, id);
+	}
+
+	private restoreElements(snapshot: SerializedElement[]): void {
+		this.elementsGroup.replaceChildren();
+		this.elements = snapshot.map((s) => this.createFromSerialized(s));
+	}
+
+	/** Undo ("back") or redo ("forward") one step. */
+	private travel(direction: "back" | "forward"): void {
+		if (this.textEditor) this.cancelTextEditor();
+		const now = this.cloneElements();
+		const target = direction === "back" ? this.history.back(now) : this.history.forward(now);
+		if (!target) return;
+		this.restoreElements(target);
+		this.selection.clear();
+		this.renderSelectionOverlay();
+		this.markDirtyAndScheduleSave();
+	}
+
+	private async confirmClear(): Promise<void> {
+		if (this.elements.length === 0) return;
+		if (!(await askToConfirm(this.app, "Clear the whole drawing?", "Clear"))) return;
+		this.checkpoint();
+		this.elementsGroup.replaceChildren();
+		this.elements = [];
+		this.selection.clear();
+		this.renderSelectionOverlay();
+		this.markDirtyAndScheduleSave();
+	}
+
+	// --- Keyboard shortcuts (only while this view is the active leaf) ---
+
+	private isFocusedView(): boolean {
+		return this.app.workspace.getActiveViewOfType(DrawingView) === this;
+	}
+
+	/** Keys typed into a text field (a label being edited, Obsidian's own
+	 * inputs) are text, not shortcuts. */
+	private isTyping(target: EventTarget | null): boolean {
+		const el = target as HTMLElement | null;
+		return !!el?.closest?.("input, textarea, select, [contenteditable='true'], [contenteditable='']");
+	}
+
+	private onKeyDown(e: KeyboardEvent): void {
+		if (!this.isFocusedView() || this.isTyping(e.target)) return;
+		const shortcut = this.shortcutFor(e);
+		if (!shortcut) return;
+		if (!shortcut.letThrough) e.preventDefault();
+		shortcut.run();
+	}
+
+	/** What a key press does in the editor, if anything. `letThrough` keeps
+	 * the browser's own handling too. */
+	private shortcutFor(e: KeyboardEvent): { run: () => void; letThrough?: boolean } | null {
+		const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+		const cmd = e.metaKey || e.ctrlKey;
+		const selected = this.selection.size > 0;
+		const undo = { run: () => this.travel("back") };
+		const redo = { run: () => this.travel("forward") };
+
+		if (key === " " && !cmd) return { run: () => this.holdSpace() };
+		if (key === "Escape") {
+			const heldTrail = this.plugin.settings.laserTrail === "hold" && this.laser?.trails.some((t) => t.fadeFrom === null);
+			if (heldTrail) return { run: () => this.fadeLaserTrails() };
+			if (this.presenting) return { run: () => this.exitPresentation() };
+			if (selected) return { run: () => this.clearSelection() };
+			return null;
+		}
+
+		if (cmd) {
+			if (e.altKey) return null;
+			if (e.shiftKey) return key === "z" ? redo : null;
+			const withCmd: Record<string, { run: () => void; letThrough?: boolean }> = {
+				z: undo,
+				y: redo,
+				a: { run: () => this.selectAll() },
+				c: { run: () => this.copySelection() },
+				x: { run: () => this.cutSelection() },
+				d: { run: () => this.duplicateSelection() },
+				// The browser must still fire its paste event (for images).
+				v: { run: () => this.pasteSoon(), letThrough: true },
+			};
+			if (withCmd[key]) return withCmd[key];
+			// Ctrl+R redoes too (but not Cmd+R, which reloads Obsidian).
+			return key === "r" && e.ctrlKey && !e.metaKey ? redo : null;
+		}
+
+		const arrow: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+		if (arrow[key] && selected) {
+			const step = e.shiftKey ? NUDGE_BIG_PX : NUDGE_PX;
+			return { run: () => this.nudgeSelection(arrow[key][0] * step, arrow[key][1] * step) };
+		}
+		if ((key === "Delete" || key === "Backspace") && selected) return { run: () => this.deleteSelected() };
+		if (e.altKey || e.shiftKey) return null;
+
+		if (key === "u") return undo;
+		const tool = KEY_TOOLS[key];
+		if (tool) return { run: () => this.setTool(tool), letThrough: true };
+		const color = KEY_COLORS[key];
+		if (color) {
+			return {
+				run: () => {
+					this.currentColor = color;
+					this.refreshUi();
+				},
+				letThrough: true,
+			};
+		}
+		return null;
+	}
+
+	/** Space held: any drag pans, until it's released (see the keyup listener). */
+	private holdSpace(): void {
+		if (this.spaceHeld) return;
+		this.spaceHeld = true;
+		this.applyToolClass();
+	}
+
+	private clearSelection(): void {
+		this.selection.clear();
+		this.renderSelectionOverlay();
+	}
+
+	/** Cmd/Ctrl+V: an image on the system clipboard arrives as a paste event
+	 * (see handlePaste) and wins; otherwise the copied elements are pasted
+	 * once it's clear no image is coming. */
+	private pasteSoon(): void {
+		if (this.pasteFallbackTimer !== null) window.clearTimeout(this.pasteFallbackTimer);
+		this.pasteFallbackTimer = window.setTimeout(() => {
+			this.pasteFallbackTimer = null;
+			this.paste();
+		}, 100);
+	}
+
+	// --- Persistence ---
+
+	private async done(): Promise<void> {
+		if (this.textEditor) this.commitTextEditor();
+		await this.flushSave();
+		this.leaf.detach();
+	}
+
+	// --- Input diagnostics (debug HUD) ---
+
+	toggleDiagnostics(): void {
+		if (this.diag) {
+			cancelAnimationFrame(this.diag.rafId);
+			this.diag.el.remove();
+			this.diag = null;
+			return;
+		}
+		const el = this.canvasWrapEl.createDiv({ cls: "quick-sketch-diag" });
+		this.diag = {
+			el,
+			penDowns: 0,
+			lastDeliveryMs: 0,
+			maxDeliveryMs: 0,
+			lastLiftGapMs: 0,
+			lastDownToMoveMs: 0,
+			awaitingFirstMove: null,
+			maxDownHandlerMs: 0,
+			maxUpHandlerMs: 0,
+			longFrames: 0,
+			maxFrameMs: 0,
+			lastFrameAt: performance.now(),
+			rafId: 0,
+			touchesAccepted: 0,
+			touchesRejected: 0,
+			missedPointerUps: 0,
+			lastSaveMs: 0,
+			lastPenUpAt: 0,
+		};
+		const tick = (now: number) => {
+			const d = this.diag;
+			if (!d) return;
+			const frame = now - d.lastFrameAt;
+			d.lastFrameAt = now;
+			if (frame > 50) d.longFrames++;
+			d.maxFrameMs = Math.max(d.maxFrameMs, frame);
+			const f = (n: number) => n.toFixed(0).padStart(4);
+			d.el.setText(
+				[
+					`pen downs        ${d.penDowns}`,
+					`event delivery   last ${f(d.lastDeliveryMs)}ms  max ${f(d.maxDeliveryMs)}ms`,
+					`lift gap         ${f(d.lastLiftGapMs)}ms`,
+					`down→first move  ${f(d.lastDownToMoveMs)}ms`,
+					`handler max      down ${f(d.maxDownHandlerMs)}ms  up ${f(d.maxUpHandlerMs)}ms`,
+					`frames >50ms     ${d.longFrames}  worst ${f(d.maxFrameMs)}ms`,
+					`touch (palm)     accepted ${d.touchesAccepted}  rejected ${d.touchesRejected}`,
+					`missed pen-ups   ${d.missedPointerUps}`,
+					`last save        ${f(d.lastSaveMs)}ms`,
+					`elements ${this.elements.length}  zoom ${Math.round(this.zoom * 100)}%`,
+				].join("\n")
+			);
+			d.rafId = requestAnimationFrame(tick);
+		};
+		this.diag.rafId = requestAnimationFrame(tick);
+	}
+
+	private markDirtyAndScheduleSave(): void {
+		this.dirty = true;
+		this.showZoom();
+		this.saveSoon();
+	}
+
+	private saveSoon(): void {
+		this.cancelScheduledSave();
+		this.saveTimer = window.setTimeout(() => {
+			this.saveTimer = null;
+			// Still mid-stroke/drag (e.g. a pointerup that never arrived)? Try later.
+			if (this.isInteracting()) {
+				this.saveSoon();
+				return;
+			}
+			void this.flushSave();
+		}, SAVE_DEBOUNCE_MS);
+	}
+
+	private cancelScheduledSave(): void {
+		if (this.saveTimer) {
+			window.clearTimeout(this.saveTimer);
+			this.saveTimer = null;
+		}
+	}
+
+	private isInteracting(): boolean {
+		return !!(
+			this.activeStroke ||
+			this.activeShapeDraw ||
+			this.selectionDrag ||
+			this.selectionResize ||
+			this.endpointDrag ||
+			this.lasso ||
+			this.marquee ||
+			this.erasing ||
+			this.panDrag
+		);
+	}
+
+	private async flushSave(): Promise<void> {
+		if (this.saveTimer) {
+			window.clearTimeout(this.saveTimer);
+			this.saveTimer = null;
+		}
+		if (!this.dirty || !this.filePath || !this.elementsGroup) return;
+		const file = this.app.vault.getAbstractFileByPath(this.filePath);
+		if (!(file instanceof TFile)) return;
+		// Never write a drawing that has elements as an empty one: it would
+		// crop to nothing and show blank in notes. Stays dirty for a retry.
+		const box = this.measureContent();
+		if (this.elements.length > 0 && box.width === 0 && box.height === 0) return;
+		this.dirty = false;
+		// Embeds of this file in open notes are refreshed by the plugin's
+		// vault "modify" listener (see QuickSketchPlugin.refreshSvgEmbeds).
+		const t0 = performance.now();
+		await this.app.vault.modify(file, this.exportCroppedSvg());
+		if (this.diag) this.diag.lastSaveMs = performance.now() - t0;
+	}
+
+	/** The drawn content's bounding box in canvas units. The live SVG can't
+	 * be measured while it isn't rendered (its tab is in the background, or
+	 * the view is closing): getBBox() then reports 0x0. In that case a copy
+	 * is measured in an invisible, but rendered, SVG instead. */
+	private measureContent(): DOMRect {
+		const live = this.elementsGroup.getBBox();
+		if (live.width > 0 || live.height > 0 || this.elements.length === 0) return live;
+		const probe = document.body.createSvg("svg", { attr: { width: "1", height: "1" } });
+		probe.setCssStyles({ position: "fixed", left: "-10000px", top: "0", visibility: "hidden", pointerEvents: "none" });
+		try {
+			return probe.appendChild(this.elementsGroup.cloneNode(true) as SVGGElement).getBBox();
+		} finally {
+			probe.remove();
+		}
+	}
+
+	/** Serializes only the drawn elements, cropped to their bounding box --
+	 * the huge editing workspace never gets saved, just what was actually
+	 * drawn. Every element's geometry is recoverable from its native SVG
+	 * attributes -- freehand raw points included, since buildSmoothPath's
+	 * `d` encodes them exactly (see parseSmoothPath). */
+	private exportCroppedSvg(clean = false): string {
+		const bbox = this.measureContent();
+		const hasContent = bbox.width > 0 || bbox.height > 0;
+
+		const x = hasContent ? bbox.x - CROP_PADDING : 0;
+		const y = hasContent ? bbox.y - CROP_PADDING : 0;
+		const width = hasContent ? bbox.width + CROP_PADDING * 2 : EMPTY_EXPORT_WIDTH;
+		const height = hasContent ? bbox.height + CROP_PADDING * 2 : EMPTY_EXPORT_HEIGHT;
+
+		const exportSvg = document.createElementNS(SVG_NS, "svg") as SVGSVGElement;
+		exportSvg.setAttribute("xmlns", SVG_NS);
+		exportSvg.setAttribute("viewBox", `${fmt(x)} ${fmt(y)} ${fmt(width)} ${fmt(height)}`);
+		exportSvg.setAttribute("width", String(Math.round(width)));
+		exportSvg.setAttribute("height", String(Math.round(height)));
+		for (const node of Array.from(this.elementsGroup.childNodes)) exportSvg.appendChild(node.cloneNode(true));
+		if (!clean) exportSvg.setAttribute("data-paper", this.paper);
+		// Element ids are only needed by arrows attached to them.
+		const referenced = new Set<string>();
+		for (const e of this.elements) {
+			if (e.kind !== "arrow") continue;
+			if (e.startBind) referenced.add(e.startBind);
+			if (e.endBind) referenced.add(e.endBind);
+		}
+		exportSvg.querySelectorAll("[data-id]").forEach((el) => {
+			if (!referenced.has(el.getAttribute("data-id") ?? "")) el.removeAttribute("data-id");
+		});
+		// Hoist the presentation attributes nearly every element repeats onto
+		// the root, where children inherit them. Only top-level children are
+		// touched (the loader reads those; nested arrow parts stay as-is), and
+		// only when the value matches -- text sets its own fill, so it's
+		// unaffected. Caps/joins are no-ops on closed shapes.
+		const shared: Record<string, string> = { fill: "none", "stroke-linecap": "round", "stroke-linejoin": "round" };
+		for (const [attr, value] of Object.entries(shared)) exportSvg.setAttribute(attr, value);
+		for (const child of Array.from(exportSvg.children)) {
+			for (const [attr, value] of Object.entries(shared)) {
+				if (child.getAttribute(attr) === value) child.removeAttribute(attr);
+			}
+		}
+
+		if (this.paper !== "none" && this.plugin.settings.paperInExport) {
+			const bg = document.createElementNS(SVG_NS, "rect");
+			bg.setAttribute("data-paper-bg", "true");
+			bg.setAttribute("x", fmt(x));
+			bg.setAttribute("y", fmt(y));
+			bg.setAttribute("width", fmt(width));
+			bg.setAttribute("height", fmt(height));
+			bg.setAttribute("fill", "url(#qs-paper)");
+			const defs = document.createElementNS(SVG_NS, "defs");
+			defs.appendChild(parseSvg(`<svg xmlns="${SVG_NS}">${paperPattern(this.paper)}</svg>`).firstElementChild as Element);
+			exportSvg.prepend(defs, bg);
+		}
+
+		// Exports for other apps: without our own bookkeeping attributes.
+		if (clean) {
+			for (const el of [exportSvg, ...Array.from(exportSvg.querySelectorAll("*"))]) {
+				for (const attr of Array.from(el.attributes)) if (attr.name.startsWith("data-")) el.removeAttribute(attr.name);
+			}
+		}
+
+		return new XMLSerializer().serializeToString(exportSvg);
+	}
+
+	private pngOf(svg: string): Promise<Blob> {
+		const w = parseFloat(/width="([\d.]+)"/.exec(svg)?.[1] ?? "") || EMPTY_EXPORT_WIDTH;
+		const h = parseFloat(/height="([\d.]+)"/.exec(svg)?.[1] ?? "") || EMPTY_EXPORT_HEIGHT;
+		const s = this.plugin.settings;
+		return svgToPng(svg, w, h, s.pngScale || 2, s.pngBackground === "transparent" ? null : "#ffffff");
+	}
+
+	/** Copies the whole drawing to the clipboard as a PNG image. Kept
+	 * synchronous up to the clipboard write so WebKit treats it as part of
+	 * the tap that triggered it. */
+	copyAsPng(): void {
+		if (this.textEditor) this.commitTextEditor();
+		copyPngToClipboard(this.pngOf(this.exportCroppedSvg())).then(
+			() => new Notice("Drawing copied as PNG."),
+			(err: Error) => new Notice(`Couldn't copy the drawing: ${err.message}`)
+		);
+	}
+
+	/** Exports the drawing as a PNG wherever the user chooses. */
+	async exportPng(): Promise<void> {
+		if (this.textEditor) this.commitTextEditor();
+		const svg = this.exportCroppedSvg();
+		await this.runExport("png", "image/png", "PNG image", () => this.pngOf(svg));
+	}
+
+	/** Recomputes an element's rendered SVG attributes from its geometry
+	 * fields. Called on creation, on every drag-resize frame while drawing a
+	 * shape, and after moving a selection. */
+	private applyGeometry(elem: DrawnElement): void {
+		if (elem.kind === "freehand") {
+			elem.el.setAttribute("d", freehandPathData(elem.points, elem.size, !!elem.pressure));
+			if (elem.pressure) {
+				// The outline can't be turned back into points, so the
+				// centerline and pressures are kept alongside it.
+				elem.el.setAttribute("data-line", buildSmoothPath(elem.points));
+				elem.el.setAttribute("data-pressure", encodePressure(elem.points));
+			}
+			return;
+		}
+		if (elem.kind === "text") {
+			elem.el.setAttribute("font-size", fmt(elem.size));
+			elem.el.setAttribute("x", fmt(elem.x));
+			elem.el.setAttribute("y", fmt(elem.y));
+			elem.el.querySelectorAll("tspan").forEach((t) => t.setAttribute("x", fmt(elem.x)));
+			return;
+		}
+
+		const minX = Math.min(elem.x0, elem.x1);
+		const maxX = Math.max(elem.x0, elem.x1);
+		const minY = Math.min(elem.y0, elem.y1);
+		const maxY = Math.max(elem.y0, elem.y1);
+
+		if (elem.kind === "rectangle") {
+			const rect = elem.el as SVGRectElement;
+			rect.setAttribute("x", fmt(minX));
+			rect.setAttribute("y", fmt(minY));
+			rect.setAttribute("width", fmt(maxX - minX));
+			rect.setAttribute("height", fmt(maxY - minY));
+		} else if (elem.kind === "ellipse") {
+			const ellipse = elem.el as SVGEllipseElement;
+			ellipse.setAttribute("cx", fmt((minX + maxX) / 2));
+			ellipse.setAttribute("cy", fmt((minY + maxY) / 2));
+			ellipse.setAttribute("rx", fmt((maxX - minX) / 2));
+			ellipse.setAttribute("ry", fmt((maxY - minY) / 2));
+		} else if (elem.kind === "diamond") {
+			const polygon = elem.el as SVGPolygonElement;
+			const midX = (minX + maxX) / 2;
+			const midY = (minY + maxY) / 2;
+			polygon.setAttribute(
+				"points",
+				`${fmt(midX)},${fmt(minY)} ${fmt(maxX)},${fmt(midY)} ${fmt(midX)},${fmt(maxY)} ${fmt(minX)},${fmt(midY)}`
+			);
+		} else if (elem.kind === "triangle") {
+			const polygon = elem.el as SVGPolygonElement;
+			const midX = (minX + maxX) / 2;
+			polygon.setAttribute("points", `${fmt(midX)},${fmt(minY)} ${fmt(minX)},${fmt(maxY)} ${fmt(maxX)},${fmt(maxY)}`);
+		} else if (elem.kind === "arrow") {
+			this.applyArrowGeometry(elem);
+		} else if (elem.kind === "image") {
+			elem.el.setAttribute("x", fmt(minX));
+			elem.el.setAttribute("y", fmt(minY));
+			elem.el.setAttribute("width", fmt(maxX - minX));
+			elem.el.setAttribute("height", fmt(maxY - minY));
+		}
+		this.applyLabelGeometry(elem);
+	}
+
+	/** Where a shape's label goes: the center of a closed shape, or a point
+	 * just off the midpoint of an arrow, on its upper side. `side` says how
+	 * the text hangs off that point. */
+	private labelAnchor(elem: ShapeElement, fontSize: number): Point & { side: "center" | "above" | "left" | "right" } {
+		const mx = (elem.x0 + elem.x1) / 2;
+		const my = (elem.y0 + elem.y1) / 2;
+		if (elem.kind !== "arrow") return { x: mx, y: my, side: "center" };
+		const dx = elem.x1 - elem.x0;
+		const dy = elem.y1 - elem.y0;
+		const len = Math.hypot(dx, dy);
+		let nx = 0;
+		let ny = -1;
+		if (len >= 1) {
+			nx = -dy / len;
+			ny = dx / len;
+			// Use whichever normal points up (or left, for a vertical line).
+			if (ny > 0 || (ny === 0 && nx > 0)) {
+				nx = -nx;
+				ny = -ny;
+			}
+		}
+		const gap = elem.size / 2 + fontSize * 0.3;
+		const x = mx + nx * gap;
+		const y = my + ny * gap;
+		// A steep line has no room above its midpoint; put the label beside it.
+		const side = Math.abs(nx) > 0.7 ? (nx < 0 ? "left" : "right") : "above";
+		return { x, y, side };
+	}
+
+	/** The area a label may occupy: the largest centered box that fits
+	 * inside a closed shape (minus stroke and padding), or a strip along an
+	 * arrow as wide as the arrow is long. */
+	private labelBox(elem: ShapeElement): { width: number; height: number } {
+		const w = Math.abs(elem.x1 - elem.x0);
+		const h = Math.abs(elem.y1 - elem.y0);
+		const pad = elem.size + 4;
+		if (elem.kind === "arrow") return { width: Math.max(Math.hypot(w, h) * 0.9, 40), height: Infinity };
+		// Inscribed box: the full box for a rectangle, w/sqrt2 x h/sqrt2 for an
+		// ellipse, half each way for a diamond (and the legacy triangle).
+		const k = elem.kind === "rectangle" ? 1 : elem.kind === "ellipse" ? Math.SQRT1_2 : 0.5;
+		return { width: Math.max(0, w * k - pad * 2), height: Math.max(0, h * k - pad * 2) };
+	}
+
+	private applyLabelGeometry(elem: ShapeElement): void {
+		const textEl = elem.labelEl;
+		if (!textEl || !elem.label) return;
+		const baseSize = elem.labelSize ?? DEFAULT_STROKE_PX * TEXT_SIZE_MULTIPLIER;
+
+		// Re-wrap only when the text or the shape's size changed -- moving a
+		// shape calls this every frame and shouldn't re-measure.
+		const box = this.labelBox(elem);
+		const key = `${elem.label}|${baseSize}|${fmt(box.width)}|${fmt(box.height)}`;
+		if (elem.labelFitKey !== key) {
+			elem.labelFitKey = key;
+			const { lines, fontSize } = fitLabel(elem.label, baseSize, box.width, box.height);
+			textEl.setAttribute("font-size", fmt(fontSize));
+			textEl.replaceChildren();
+			for (const line of lines) {
+				const tspan = document.createElementNS(SVG_NS, "tspan");
+				tspan.textContent = line;
+				textEl.appendChild(tspan);
+			}
+		}
+
+		const fontSize = parseFloat(textEl.getAttribute("font-size") ?? "") || baseSize;
+		const a = this.labelAnchor(elem, fontSize);
+		const tspans = Array.from(textEl.querySelectorAll("tspan"));
+		const n = tspans.length;
+		textEl.setAttribute("x", fmt(a.x));
+		textEl.setAttribute("y", fmt(a.y));
+		textEl.setAttribute("text-anchor", a.side === "left" ? "end" : a.side === "right" ? "start" : "middle");
+		const lh = LABEL_LINE_HEIGHT;
+		if (a.side === "above") {
+			// Lines stack upward so the last one sits just above the line.
+			textEl.removeAttribute("dominant-baseline");
+			tspans.forEach((t, i) => t.setAttribute("dy", i === 0 ? `${fmt(-(n - 1) * lh)}em` : `${lh}em`));
+		} else {
+			// Vertically center the block of lines on the anchor.
+			textEl.setAttribute("dominant-baseline", "central");
+			tspans.forEach((t, i) => t.setAttribute("dy", i === 0 ? `${fmt((-(n - 1) * lh) / 2)}em` : `${lh}em`));
+		}
+		tspans.forEach((t) => t.setAttribute("x", fmt(a.x)));
+	}
+
+	/** Sets (or, with `label` undefined, removes) a shape's label. A labeled
+	 * shape lives in a <g data-kind="labeled"> together with its <text
+	 * data-label>, so the two are one unit: they move, erase, delete and
+	 * undo together, and the saved file keeps them grouped. */
+	private setShapeLabel(elem: ShapeElement, label: string | undefined, baseSize: number): void {
+		elem.labelEl?.remove();
+		elem.labelEl = undefined;
+		elem.labelFitKey = undefined;
+		elem.label = label;
+		elem.labelSize = label ? baseSize : undefined;
+
+		if (!label) {
+			// Unwrap: put the bare shape back where the group was.
+			if (elem.labelGroup) {
+				elem.labelGroup.replaceWith(elem.el);
+				elem.labelGroup = undefined;
+			}
+			return;
+		}
+
+		if (!elem.labelGroup) {
+			const g = document.createElementNS(SVG_NS, "g") as SVGGElement;
+			g.setAttribute("data-kind", "labeled");
+			if (elem.el.parentNode) elem.el.replaceWith(g);
+			else this.elementsGroup.appendChild(g);
+			g.appendChild(elem.el);
+			elem.labelGroup = g;
+		}
+		const textEl = document.createElementNS(SVG_NS, "text") as SVGTextElement;
+		textEl.setAttribute("data-label", "true");
+		textEl.setAttribute("data-label-size", String(baseSize));
+		// Text on a solid fill needs to contrast with the fill, not match it.
+		textEl.setAttribute("fill", elem.fill === "solid" ? contrastColor(elem.color) : elem.color);
+		textEl.setAttribute("font-family", "sans-serif");
+		elem.labelGroup.appendChild(textEl);
+		elem.labelEl = textEl;
+		this.applyLabelGeometry(elem);
+	}
+
+	private removeElementDom(elem: DrawnElement): void {
+		if (elem.kind !== "freehand" && elem.kind !== "text" && elem.labelGroup) elem.labelGroup.remove();
+		else elem.el.remove();
+	}
+
+	private applyArrowGeometry(elem: ShapeElement): void {
+		const g = elem.el as SVGGElement;
+		const line = g.querySelector("line");
+		if (!line) return;
+		line.setAttribute("x1", fmt(elem.x0));
+		line.setAttribute("y1", fmt(elem.y0));
+		line.setAttribute("x2", fmt(elem.x1));
+		line.setAttribute("y2", fmt(elem.y1));
+
+		// Saved attributes: which ends have heads ("end" is the default and
+		// what older files mean), and which shapes the ends are attached to.
+		const heads = elem.heads ?? "end";
+		if (heads === "end") g.removeAttribute("data-heads");
+		else g.setAttribute("data-heads", heads);
+		if (elem.startBind) g.setAttribute("data-start", elem.startBind);
+		else g.removeAttribute("data-start");
+		if (elem.endBind) g.setAttribute("data-end", elem.endBind);
+		else g.removeAttribute("data-end");
+
+		const want = heads === "none" ? 0 : heads === "end" ? 1 : 2;
+		const polys = Array.from(g.querySelectorAll("polygon"));
+		while (polys.length < want) {
+			const head = document.createElementNS(SVG_NS, "polygon") as SVGPolygonElement;
+			head.setAttribute("fill", elem.color);
+			g.appendChild(head);
+			polys.push(head);
+		}
+		while (polys.length > want) polys.pop()?.remove();
+
+		const headLen = Math.max(10, elem.size * 4);
+		const headAngle = Math.PI / 7; // ~25.7 degrees
+		const drawHead = (poly: SVGPolygonElement, tipX: number, tipY: number, fromX: number, fromY: number) => {
+			const angle = Math.atan2(tipY - fromY, tipX - fromX);
+			const p1x = tipX - headLen * Math.cos(angle - headAngle);
+			const p1y = tipY - headLen * Math.sin(angle - headAngle);
+			const p2x = tipX - headLen * Math.cos(angle + headAngle);
+			const p2y = tipY - headLen * Math.sin(angle + headAngle);
+			poly.setAttribute("points", `${fmt(tipX)},${fmt(tipY)} ${fmt(p1x)},${fmt(p1y)} ${fmt(p2x)},${fmt(p2y)}`);
+		};
+		if (want >= 1) drawHead(polys[0], elem.x1, elem.y1, elem.x0, elem.y0);
+		if (want === 2) drawHead(polys[1], elem.x0, elem.y0, elem.x1, elem.y1);
+	}
+
+	private createFreehandElement(
+		color: string,
+		size: number,
+		points: Point[],
+		id?: string,
+		highlight = false
+	): FreehandElement {
+		const pressure = !highlight && points.some((p) => p.p !== undefined);
+		const pathEl = document.createElementNS(SVG_NS, "path") as SVGPathElement;
+		this.styleFreehandPath(pathEl, color, size, highlight, pressure);
+		this.insertPath(pathEl, highlight);
+		const elem: FreehandElement = { id: id ?? newElementId(), kind: "freehand", el: pathEl, color, size, points, highlight, pressure: pressure || undefined };
+		this.applyGeometry(elem);
+		return elem;
+	}
+
+	private createShapeElement(data: ShapeData, id?: string): ShapeElement {
+		const { kind, color, size } = data;
+		let el: SVGGraphicsElement;
+		if (kind === "rectangle") {
+			el = document.createElementNS(SVG_NS, "rect") as SVGRectElement;
+			el.setAttribute("stroke", color);
+			el.setAttribute("stroke-width", String(size));
+			el.setAttribute("fill", "none");
+			el.setAttribute("stroke-linejoin", "round");
+		} else if (kind === "ellipse") {
+			el = document.createElementNS(SVG_NS, "ellipse") as SVGEllipseElement;
+			el.setAttribute("stroke", color);
+			el.setAttribute("stroke-width", String(size));
+			el.setAttribute("fill", "none");
+		} else if (kind === "diamond" || kind === "triangle") {
+			el = document.createElementNS(SVG_NS, "polygon") as SVGPolygonElement;
+			el.setAttribute("stroke", color);
+			el.setAttribute("stroke-width", String(size));
+			el.setAttribute("fill", "none");
+			el.setAttribute("stroke-linejoin", "round");
+		} else if (kind === "image") {
+			el = document.createElementNS(SVG_NS, "image") as SVGImageElement;
+			el.setAttribute("href", data.href ?? "");
+			// The box is the image's size; resizing it stretches the picture.
+			el.setAttribute("preserveAspectRatio", "none");
+		} else {
+			// Arrow: a <g> wrapping a shaft <line> and a solid-filled arrowhead
+			// <polygon>, rather than an SVG <marker> -- avoids marker/defs
+			// bookkeeping and keeps the arrowhead's angle trivially correct at
+			// any orientation.
+			const g = document.createElementNS(SVG_NS, "g") as SVGGElement;
+			g.setAttribute("data-kind", "arrow");
+			const line = document.createElementNS(SVG_NS, "line") as SVGLineElement;
+			line.setAttribute("stroke", color);
+			line.setAttribute("stroke-width", String(size));
+			line.setAttribute("stroke-linecap", "round");
+			g.appendChild(line);
+			// Arrowheads are added by applyArrowGeometry, per `heads`.
+			el = g;
+		}
+		if (kind === "image") {
+			// Pictures sit beneath everything drawn, so you can draw over them.
+			const firstNonImage = Array.from(this.elementsGroup.children).find((c) => c.tagName.toLowerCase() !== "image");
+			this.elementsGroup.insertBefore(el, firstNonImage ?? null);
+		} else {
+			this.elementsGroup.appendChild(el);
+		}
+		const dash = kind === "image" ? undefined : data.dash;
+		const pattern = dashArray(dash, size);
+		if (pattern) {
+			const stroked = kind === "arrow" ? el.querySelector("line") : el;
+			stroked?.setAttribute("stroke-dasharray", pattern);
+			stroked?.setAttribute("stroke-linecap", "round");
+			el.setAttribute("data-dash", dash as string);
+		}
+		const elem: ShapeElement = {
+			id: id ?? newElementId(),
+			kind,
+			el,
+			color,
+			size,
+			x0: data.x0,
+			y0: data.y0,
+			x1: data.x1,
+			y1: data.y1,
+			fill: kind === "arrow" ? undefined : data.fill,
+			heads: kind === "arrow" ? data.heads : undefined,
+			startBind: kind === "arrow" ? data.startBind : undefined,
+			endBind: kind === "arrow" ? data.endBind : undefined,
+			dash,
+			href: kind === "image" ? data.href : undefined,
+		};
+		if (kind !== "arrow") {
+			// Lets arrows in the saved file refer to this shape.
+			el.setAttribute("data-id", elem.id);
+			if (elem.fill && elem.fill !== "none") {
+				el.setAttribute("fill", color);
+				if (elem.fill === "light") el.setAttribute("fill-opacity", String(LIGHT_FILL_OPACITY));
+			}
+		}
+		if (data.label) this.setShapeLabel(elem, data.label, data.labelSize ?? DEFAULT_STROKE_PX * TEXT_SIZE_MULTIPLIER);
+		this.applyGeometry(elem);
+		return elem;
+	}
+
+	private createTextElement(color: string, fontSize: number, x: number, y: number, text: string, id?: string): TextElement {
+		const textEl = document.createElementNS(SVG_NS, "text") as SVGTextElement;
+		textEl.setAttribute("fill", color);
+		textEl.setAttribute("font-size", String(fontSize));
+		textEl.setAttribute("font-family", "sans-serif");
+		textEl.setAttribute("x", fmt(x));
+		textEl.setAttribute("y", fmt(y));
+		this.elementsGroup.appendChild(textEl);
+		const elem: TextElement = { id: id ?? newElementId(), kind: "text", el: textEl, color, size: fontSize, x, y, text };
+		textEl.setAttribute("data-id", elem.id);
+		this.setTextContent(elem, text);
+		return elem;
+	}
+
+	/** Replaces a text element's text, one <tspan> per line. */
+	private setTextContent(elem: TextElement, text: string): void {
+		elem.text = text;
+		elem.el.replaceChildren();
+		for (const line of text.split("\n")) {
+			const tspan = document.createElementNS(SVG_NS, "tspan");
+			tspan.setAttribute("x", fmt(elem.x));
+			tspan.setAttribute("dy", elem.el.childElementCount === 0 ? "0" : "1.2em");
+			tspan.textContent = line;
+			elem.el.appendChild(tspan);
+		}
+	}
+
+	private async loadFromFile(): Promise<void> {
+		if (!this.filePath) return;
+		const file = this.app.vault.getAbstractFileByPath(this.filePath);
+		let content = EMPTY_SVG;
+		if (file instanceof TFile) {
+			try {
+				content = await this.app.vault.read(file);
+			} catch {
+				content = EMPTY_SVG;
+			}
+		}
+		this.applySvgContent(content);
+	}
+
+	/** Loads previously-cropped elements into the big workspace, recentered so
+	 * there's equal room to keep drawing in any direction around them. */
+	private applySvgContent(content: string): void {
+		this.activeStroke = null;
+		this.activeShapeDraw = null;
+		this.cancelTextEditor();
+		this.selection.clear();
+		this.marquee = null;
+		this.selectionDrag = null;
+		this.elementsGroup.replaceChildren();
+		if (this.overlayGroup) this.overlayGroup.replaceChildren();
+		this.elements = [];
+
+		let root: Element | null = null;
+		try {
+			const parsed = new DOMParser().parseFromString(content, "image/svg+xml");
+			root = parsed.documentElement;
+			if (!root || root.tagName.toLowerCase() !== "svg" || parsed.querySelector("parsererror")) root = null;
+		} catch {
+			root = null;
+		}
+		const savedPaper = root?.getAttribute("data-paper");
+		this.paper =
+			savedPaper === "none" || savedPaper === "dots" || savedPaper === "grid" || savedPaper === "lines"
+				? savedPaper
+				: root && root.children.length > 0
+					? "none"
+					: this.plugin.settings.defaultPaper;
+		this.applyPaper();
+		if (!root) return;
+
+		type RawElement =
+			| { kind: "freehand"; color: string; size: number; points: Point[]; highlight: boolean }
+			| (ShapeData & { id?: string })
+			| { kind: "text"; color: string; size: number; x: number; y: number; text: string; id?: string };
+
+		// Saved fills: "none" (or absent -- hoisted onto the root), a
+		// translucent tint (fill-opacity < 1), or solid.
+		const readFill = (el: Element): FillStyle | undefined => {
+			const fill = el.getAttribute("fill");
+			if (!fill || fill === "none") return undefined;
+			return parseFloat(el.getAttribute("fill-opacity") ?? "1") < 1 ? "light" : "solid";
+		};
+		const readId = (el: Element) => el.getAttribute("data-id") ?? undefined;
+		const readDash = (el: Element): DashStyle | undefined => {
+			const d = el.getAttribute("data-dash");
+			return d === "dashed" || d === "dotted" ? d : undefined;
+		};
+
+		const raw: RawElement[] = [];
+		// Every element this plugin writes is a direct child of the exported
+		// <svg> root (see exportCroppedSvg); a shallow scan -- rather than
+		// querySelectorAll, which would also match the arrowhead <polygon>
+		// nested inside an arrow's <g> -- keeps each top-level element counted
+		// exactly once.
+		// A labeled shape is saved as <g data-kind="labeled"><shape/><text
+		// data-label/></g>; flatten it so the shape is read as usual and the
+		// label attaches to it below.
+		const children = Array.from(root.children).flatMap((c) =>
+			c.tagName.toLowerCase() === "g" && c.getAttribute("data-kind") === "labeled" ? Array.from(c.children) : [c]
+		);
+		for (const child of children) {
+			const tag = child.tagName.toLowerCase();
+			// The saved background paper (and its pattern) isn't an element.
+			if (child.hasAttribute("data-paper-bg") || tag === "defs") continue;
+			if (tag === "image") {
+				const href = child.getAttribute("href") ?? child.getAttributeNS("http://www.w3.org/1999/xlink", "href") ?? "";
+				const x = parseFloat(child.getAttribute("x") ?? "0");
+				const y = parseFloat(child.getAttribute("y") ?? "0");
+				const w = parseFloat(child.getAttribute("width") ?? "0");
+				const h = parseFloat(child.getAttribute("height") ?? "0");
+				if (href && w > 0 && h > 0) raw.push({ kind: "image", color: DEFAULT_COLOR, size: 0, x0: x, y0: y, x1: x + w, y1: y + h, href, id: readId(child) });
+			} else if (tag === "path" && child.hasAttribute("data-line")) {
+				// Pressure stroke: a filled outline, with its centerline and
+				// pressures saved alongside.
+				const points = parseSmoothPath(child.getAttribute("data-line") ?? "") ?? [];
+				decodePressure(child.getAttribute("data-pressure") ?? "", points);
+				const color = child.getAttribute("fill") ?? DEFAULT_COLOR;
+				const size = parseFloat(child.getAttribute("data-size") ?? "") || DEFAULT_STROKE_PX;
+				if (points.length > 0) raw.push({ kind: "freehand", color, size, points, highlight: false });
+			} else if (tag === "path") {
+				const color = child.getAttribute("stroke") ?? DEFAULT_COLOR;
+				const size = parseFloat(child.getAttribute("stroke-width") ?? "") || DEFAULT_STROKE_PX;
+				const d = child.getAttribute("d") ?? "";
+				let points: Point[] = parseSmoothPath(d) ?? [];
+				// Files saved before the compact path format carry a
+				// separate `data-points` copy of the raw points.
+				const dataPoints = points.length === 0 ? child.getAttribute("data-points") : null;
+				if (dataPoints) {
+					try {
+						const parsed = JSON.parse(dataPoints);
+						if (Array.isArray(parsed)) points = parsed;
+					} catch {
+						points = [];
+					}
+				}
+				if (points.length === 0) points = parseLegacyPathPoints(d);
+				const highlight = child.getAttribute("data-highlight") === "true";
+				if (points.length > 0) raw.push({ kind: "freehand", color, size, points, highlight });
+			} else if (tag === "rect") {
+				const color = child.getAttribute("stroke") ?? DEFAULT_COLOR;
+				const size = parseFloat(child.getAttribute("stroke-width") ?? "") || DEFAULT_STROKE_PX;
+				const x = parseFloat(child.getAttribute("x") ?? "0");
+				const y = parseFloat(child.getAttribute("y") ?? "0");
+				const w = parseFloat(child.getAttribute("width") ?? "0");
+				const h = parseFloat(child.getAttribute("height") ?? "0");
+				raw.push({ kind: "rectangle", color, size, x0: x, y0: y, x1: x + w, y1: y + h, fill: readFill(child), dash: readDash(child), id: readId(child) });
+			} else if (tag === "ellipse") {
+				const color = child.getAttribute("stroke") ?? DEFAULT_COLOR;
+				const size = parseFloat(child.getAttribute("stroke-width") ?? "") || DEFAULT_STROKE_PX;
+				const cx = parseFloat(child.getAttribute("cx") ?? "0");
+				const cy = parseFloat(child.getAttribute("cy") ?? "0");
+				const rx = parseFloat(child.getAttribute("rx") ?? "0");
+				const ry = parseFloat(child.getAttribute("ry") ?? "0");
+				raw.push({
+					kind: "ellipse",
+					color,
+					size,
+					x0: cx - rx,
+					y0: cy - ry,
+					x1: cx + rx,
+					y1: cy + ry,
+					fill: readFill(child),
+					dash: readDash(child),
+					id: readId(child),
+				});
+			} else if (tag === "polygon") {
+				const color = child.getAttribute("stroke") ?? DEFAULT_COLOR;
+				const size = parseFloat(child.getAttribute("stroke-width") ?? "") || DEFAULT_STROKE_PX;
+				const pts = (child.getAttribute("points") ?? "")
+					.trim()
+					.split(/\s+/)
+					.map((pair) => {
+						const [px, py] = pair.split(",").map(Number);
+						return { x: px, y: py };
+					})
+					.filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+				if (pts.length > 0) {
+					const minX = Math.min(...pts.map((p) => p.x));
+					const maxX = Math.max(...pts.map((p) => p.x));
+					const minY = Math.min(...pts.map((p) => p.y));
+					const maxY = Math.max(...pts.map((p) => p.y));
+					const kind = pts.length === 3 ? "triangle" : "diamond";
+					raw.push({ kind, color, size, x0: minX, y0: minY, x1: maxX, y1: maxY, fill: readFill(child), dash: readDash(child), id: readId(child) });
+				}
+			} else if (tag === "g" && child.getAttribute("data-kind") === "arrow") {
+				const line = child.querySelector("line");
+				const head = child.querySelector("polygon");
+				const color = line?.getAttribute("stroke") ?? head?.getAttribute("fill") ?? DEFAULT_COLOR;
+				const size = parseFloat(line?.getAttribute("stroke-width") ?? "") || DEFAULT_STROKE_PX;
+				const x0 = parseFloat(line?.getAttribute("x1") ?? "0");
+				const y0 = parseFloat(line?.getAttribute("y1") ?? "0");
+				const x1 = parseFloat(line?.getAttribute("x2") ?? "0");
+				const y1 = parseFloat(line?.getAttribute("y2") ?? "0");
+				const heads = child.getAttribute("data-heads");
+				raw.push({
+					kind: "arrow",
+					color,
+					size,
+					x0,
+					y0,
+					x1,
+					y1,
+					heads: heads === "none" || heads === "both" ? heads : undefined,
+					startBind: child.getAttribute("data-start") ?? undefined,
+					endBind: child.getAttribute("data-end") ?? undefined,
+					dash: readDash(child),
+				});
+			} else if (tag === "text" && child.hasAttribute("data-label")) {
+				// A shape's label always directly follows its shape.
+				const shape = raw[raw.length - 1];
+				const tspans = Array.from(child.querySelectorAll("tspan"));
+				const text = tspans.length > 0 ? tspans.map((t) => t.textContent ?? "").join("\n") : child.textContent ?? "";
+				if (shape && shape.kind !== "freehand" && shape.kind !== "text" && text) {
+					shape.label = text;
+					// data-label-size is the requested size; font-size may have
+					// been shrunk to fit the shape.
+					shape.labelSize =
+						parseFloat(child.getAttribute("data-label-size") ?? child.getAttribute("font-size") ?? "") ||
+						DEFAULT_STROKE_PX * TEXT_SIZE_MULTIPLIER;
+				}
+			} else if (tag === "text") {
+				const color = child.getAttribute("fill") ?? DEFAULT_COLOR;
+				const fontSize = parseFloat(child.getAttribute("font-size") ?? "") || DEFAULT_STROKE_PX * TEXT_SIZE_MULTIPLIER;
+				const x = parseFloat(child.getAttribute("x") ?? "0");
+				const y = parseFloat(child.getAttribute("y") ?? "0");
+				const tspans = Array.from(child.querySelectorAll("tspan"));
+				const text = tspans.length > 0 ? tspans.map((t) => t.textContent ?? "").join("\n") : child.textContent ?? "";
+				if (text) raw.push({ kind: "text", color, size: fontSize, x, y, text, id: readId(child) });
+			}
+		}
+		if (raw.length === 0) return;
+
+		// Recenter on the workspace: find the middle of everything loaded.
+		const corners = raw.flatMap((r): Point[] => {
+			if (r.kind === "freehand") return r.points;
+			if (r.kind === "text") return [{ x: r.x, y: r.y }];
+			return [
+				{ x: r.x0, y: r.y0 },
+				{ x: r.x1, y: r.y1 },
+			];
+		});
+		const extent = boxAround(corners) as Box;
+		const midX = (extent.left + extent.right) / 2;
+		const midY = (extent.top + extent.bottom) / 2;
+		// Shifted by whole paper tiles, so writing stays on the same lines.
+		const dx = Math.round((WORKSPACE_CENTER - midX) / PAPER_ALIGN) * PAPER_ALIGN;
+		const dy = Math.round((WORKSPACE_CENTER - midY) / PAPER_ALIGN) * PAPER_ALIGN;
+
+		this.elements = raw.map((r) => {
+			if (r.kind === "freehand") {
+				return this.createFreehandElement(
+					r.color,
+					r.size,
+					r.points.map((p) => ({ x: round1(p.x + dx), y: round1(p.y + dy), p: p.p })),
+					undefined,
+					r.highlight
+				);
+			}
+			if (r.kind === "text") {
+				return this.createTextElement(r.color, r.size, r.x + dx, r.y + dy, r.text, r.id);
+			}
+			const { id, ...data } = r;
+			return this.createShapeElement({ ...data, x0: r.x0 + dx, y0: r.y0 + dy, x1: r.x1 + dx, y1: r.y1 + dy }, id);
+		});
+	}
+
+	// --- More exports ---
+
+	/** Copies the drawing to the clipboard as SVG markup. */
+	copyAsSvg(): void {
+		if (this.textEditor) this.commitTextEditor();
+		navigator.clipboard.writeText(this.exportCroppedSvg(true)).then(
+			() => new Notice("Drawing copied as SVG."),
+			(err: Error) => new Notice(`Couldn't copy the drawing: ${err.message}`)
+		);
+	}
+
+	/** Saves an export where the user picks (Save dialog on desktop, share
+	 * sheet on iPad -- see saveExport), or else next to the drawing in the
+	 * vault. Called straight from the click: the dialogs need that. */
+	private async runExport(ext: "png" | "svg" | "pdf", mime: string, description: string, make: () => Promise<Blob>): Promise<void> {
+		if (!this.filePath) return;
+		const base = (this.filePath.split("/").pop() ?? "Drawing").replace(/\.svg$/i, "");
+		const name = ext === "svg" ? `${base} (export).svg` : `${base}.${ext}`;
+		try {
+			await saveExport(this.app, { name, mime, description, make }, async (blob) => {
+				const path = normalizePath(`${(this.filePath ?? "").replace(/[^/]*$/, "")}${name}`);
+				const data = await blob.arrayBuffer();
+				const existing = this.app.vault.getAbstractFileByPath(path);
+				if (existing instanceof TFile) await this.app.vault.modifyBinary(existing, data);
+				else await this.app.vault.createBinary(path, data);
+				new Notice(`Exported ${path}`);
+			});
+		} catch (err) {
+			new Notice(`Couldn't export the drawing: ${(err as Error).message}`);
+		}
+	}
+
+	async exportSvg(): Promise<void> {
+		if (this.textEditor) this.commitTextEditor();
+		const svg = this.exportCroppedSvg(true);
+		await this.runExport("svg", "image/svg+xml", "SVG image", async () => new Blob([svg], { type: "image/svg+xml" }));
+	}
+
+	/** A one-page PDF the size of the drawing. The drawing is embedded as an
+	 * image (at the PNG export resolution, at least 2x), on white. */
+	async exportPdf(): Promise<void> {
+		if (this.textEditor) this.commitTextEditor();
+		const svg = this.exportCroppedSvg();
+		await this.runExport("pdf", "application/pdf", "PDF document", async () => {
+			const w = parseFloat(/width="([\d.]+)"/.exec(svg)?.[1] ?? "") || EMPTY_EXPORT_WIDTH;
+			const h = parseFloat(/height="([\d.]+)"/.exec(svg)?.[1] ?? "") || EMPTY_EXPORT_HEIGHT;
+			const scale = Math.max(2, this.plugin.settings.pngScale || 2);
+			const canvas = await svgToCanvas(svg, w, h, scale, "#ffffff");
+			// CSS px -> PDF points (1/72 in), at 96 px per inch.
+			return new Blob([await canvasToPdf(canvas, w * 0.75, h * 0.75)], { type: "application/pdf" });
+		});
+	}
+
+	// --- Background paper ---
+
+	private setPaper(paper: Paper): void {
+		if (paper === this.paper) return;
+		this.paper = paper;
+		this.applyPaper();
+		this.markDirtyAndScheduleSave();
+	}
+
+	/** The paper shown while editing is a CSS background on the canvas --
+	 * cheap to draw, and it pans and zooms along with it. */
+	private applyPaper(): void {
+		if (!this.svgEl) return;
+		for (const p of ["dots", "grid", "lines"]) this.svgEl.classList.toggle(`qs-paper-${p}`, this.paper === p);
+	}
+
+	// --- Images ---
+
+	/** Opens the system picker (photos/files on iPad) for "Insert image". */
+	pickImageFile(): void {
+		this.imageInputEl?.click();
+	}
+
+	private handlePaste(e: ClipboardEvent): void {
+		if (!this.isFocusedView() || this.isTyping(e.target)) return;
+		const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith("image/"));
+		if (files.length === 0) return;
+		e.preventDefault();
+		// An image arrived: it wins over any copied elements.
+		if (this.pasteFallbackTimer !== null) {
+			window.clearTimeout(this.pasteFallbackTimer);
+			this.pasteFallbackTimer = null;
+		}
+		void this.insertImageFiles(files);
+	}
+
+	/** Inserts images centered on `at` (canvas coordinates; default: the
+	 * middle of the view), each a little offset from the one before. */
+	private async insertImageFiles(files: File[], at?: Point): Promise<void> {
+		const wrap = this.canvasWrapEl;
+		const center = at ?? { x: (wrap.clientWidth / 2 - this.panX) / this.zoom, y: (wrap.clientHeight / 2 - this.panY) / this.zoom };
+		const ids: string[] = [];
+		let i = 0;
+		for (const file of files) {
+			if (!file.type.startsWith("image/")) continue;
+			try {
+				const { href, width, height } = await loadImageFile(file);
+				const offset = PASTE_OFFSET * i++;
+				ids.push(this.insertImage(href, width, height, { x: center.x + offset, y: center.y + offset }, ids.length === 0));
+			} catch (err) {
+				new Notice(`Couldn't insert ${file.name || "the image"}: ${(err as Error).message}`);
+			}
+		}
+		if (ids.length === 0) return;
+		if (!SELECT_TOOLS.has(this.tool)) this.setTool("select");
+		this.selection = new Set(ids);
+		this.renderSelectionOverlay();
+		this.markDirtyAndScheduleSave();
+	}
+
+	/** Adds one image, scaled down to fit the view; returns its id. */
+	private insertImage(href: string, width: number, height: number, center: Point, snapshot: boolean): string {
+		if (this.textEditor) this.commitTextEditor();
+		if (snapshot) this.checkpoint();
+		const wrap = this.canvasWrapEl;
+		const k = Math.min(1, (wrap.clientWidth * IMAGE_VIEW_FRACTION) / this.zoom / width, (wrap.clientHeight * IMAGE_VIEW_FRACTION) / this.zoom / height);
+		const w = round1(width * k);
+		const h = round1(height * k);
+		const x0 = round1(center.x - w / 2);
+		const y0 = round1(center.y - h / 2);
+		const elem = this.createShapeElement({ kind: "image", color: DEFAULT_COLOR, size: 0, x0, y0, x1: x0 + w, y1: y0 + h, href });
+		this.elements.push(elem);
+		this.imagesFirst();
+		return elem.id;
+	}
+
+	/** Keeps images at the start of the element list (= the bottom of the
+	 * stack, matching where createShapeElement puts them in the DOM). */
+	private imagesFirst(): void {
+		this.elements = [...this.elements.filter((e) => e.kind === "image"), ...this.elements.filter((e) => e.kind !== "image")];
+	}
+
+	// --- Shape recognition (hold the pen still at the end of a stroke) ---
+
+	private armRecognizer(p: Point): void {
+		this.disarmRecognizer();
+		this.recognizeAnchor = p;
+		this.recognizeTimer = window.setTimeout(() => {
+			this.recognizeTimer = null;
+			this.recognizeActiveStroke();
+		}, RECOGNIZE_HOLD_MS);
+	}
+
+	private disarmRecognizer(): void {
+		if (this.recognizeTimer !== null) window.clearTimeout(this.recognizeTimer);
+		this.recognizeTimer = null;
+		this.recognizeAnchor = null;
+	}
+
+	/** Swaps the stroke being drawn for the clean shape it looks like (if
+	 * any). The pen is still down; the rest of that contact is ignored. */
+	private recognizeActiveStroke(): void {
+		const stroke = this.activeStroke;
+		if (!stroke || stroke.highlight) return;
+		// Not a shape: keep the anchor, so moving on re-arms the timer.
+		const shape = recognizeShape(stroke.points, RECOGNIZE_MIN_SIZE_PX / this.zoom);
+		if (!shape) return;
+		this.recognizeAnchor = null;
+		stroke.pathEl.remove();
+		this.releaseCapture(stroke.pointerId);
+		this.activeStroke = null;
+		const data: ShapeData = {
+			kind: shape.kind,
+			color: stroke.color,
+			size: this.currentSize,
+			x0: round1(shape.x0),
+			y0: round1(shape.y0),
+			x1: round1(shape.x1),
+			y1: round1(shape.y1),
+		};
+		if (shape.kind === "arrow") data.heads = "none";
+		this.elements.push(this.createShapeElement(data));
+		this.markDirtyAndScheduleSave();
+	}
+
+	// --- Presentation mode ---
+
+	togglePresentation(): void {
+		if (this.presenting) this.exitPresentation();
+		else this.enterPresentation();
+	}
+
+	/** Hides the toolbars, fits the drawing to the view and picks the laser.
+	 * On desktop the drawing also goes full screen. */
+	private enterPresentation(): void {
+		if (this.presenting) return;
+		if (this.textEditor) this.commitTextEditor();
+		this.presenting = true;
+		this.toolBeforePresenting = this.tool;
+		this.setTool("laser");
+		this.contentEl.addClass("qs-presenting");
+		const exit = this.contentEl.createEl("button", {
+			cls: "qs-present-exit",
+			attr: { "aria-label": "Exit presentation (Esc)", title: "Exit presentation (Esc)" },
+		});
+		setIcon(exit, ICON.close);
+		exit.onclick = (evt) => {
+			evt.preventDefault();
+			this.exitPresentation();
+		};
+		this.presentExitEl = exit;
+		if (Platform.isDesktopApp && this.contentEl.requestFullscreen) {
+			this.contentEl.requestFullscreen().catch(() => undefined);
+		}
+		requestAnimationFrame(() => this.fitToContent());
+	}
+
+	private exitPresentation(): void {
+		if (!this.presenting) return;
+		this.presenting = false;
+		this.contentEl.removeClass("qs-presenting");
+		this.presentExitEl?.remove();
+		this.presentExitEl = null;
+		if (document.fullscreenElement === this.contentEl) document.exitFullscreen().catch(() => undefined);
+		this.setTool(this.toolBeforePresenting ?? DEFAULT_TOOL);
+		this.toolBeforePresenting = null;
+	}
+
+	/** Resets zoom to 100% and recenters the viewport on the drawing's actual
+	 * content (its bounding box center), or the workspace's fixed center if
+	 * there's nothing drawn yet. Centering on the fixed workspace center
+	 * unconditionally would strand the viewport away from your work once the
+	 * content has drifted from that point -- which reads as the drawing
+	 * "moving away" and any new strokes landing in a big empty gap next to it. */
+	private centerView(): void {
+		requestAnimationFrame(() => {
+			const wrap = this.canvasWrapEl;
+			if (!wrap) return;
+			this.zoom = 1;
+			let centerX = WORKSPACE_CENTER;
+			let centerY = WORKSPACE_CENTER;
+			if (this.elements.length > 0) {
+				const bbox = this.elementsGroup.getBBox();
+				centerX = bbox.x + bbox.width / 2;
+				centerY = bbox.y + bbox.height / 2;
+			}
+			this.panX = wrap.clientWidth / 2 - centerX * this.zoom;
+			this.panY = wrap.clientHeight / 2 - centerY * this.zoom;
+			this.applyTransform();
+		});
+	}
+}

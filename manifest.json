@@ -1,0 +1,10 @@
+{
+	"id": "quick-sketch",
+	"name": "Quick Sketch",
+	"version": "1.0.0",
+	"minAppVersion": "1.7.2",
+	"description": "Sketch, diagram and present right inside your notes, with Apple Pencil support, shapes and arrows, a laser pointer, and PNG, SVG and PDF export.",
+	"author": "Rafael Papallas",
+	"authorUrl": "https://github.com/rpapallas",
+	"isDesktopOnly": false
+}
