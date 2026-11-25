@@ -123,6 +123,34 @@ It only writes outside your vault when you export a file and choose a location f
 
 ## Credits
 
+Quick Sketch has no runtime dependencies besides Obsidian itself: the plugin bundles no third-party libraries, only the icons below.
+
+### Included in the plugin
+
+| Project | Used for | License |
+| --- | --- | --- |
+| [Lucide](https://lucide.dev) | Toolbar icons | ISC (notice below) |
+
+### Provided by Obsidian
+
+| Project | Used for | License |
+| --- | --- | --- |
+| [Obsidian API](https://github.com/obsidianmd/obsidian-api) | The plugin API (views, menus, settings, vault access) | MIT |
+| [Moment.js](https://momentjs.com) | Date formatting in new drawings' file names (bundled with Obsidian) | MIT |
+
+### Used to build the plugin
+
+These tools turn the source code into `main.js`; none of them is part of the released plugin.
+
+| Project | Used for | License |
+| --- | --- | --- |
+| [esbuild](https://esbuild.github.io) | Bundling | MIT |
+| [TypeScript](https://www.typescriptlang.org) | Type checking and compiling | Apache-2.0 |
+| [builtin-modules](https://github.com/sindresorhus/builtin-modules) | Build configuration | MIT |
+| [@types/node](https://github.com/DefinitelyTyped/DefinitelyTyped) | Type definitions for the build script | MIT |
+
+### Lucide license
+
 Toolbar icons are from [Lucide](https://lucide.dev), used under the ISC License:
 
 > Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT). All other copyright (c) for Lucide are held by Lucide Contributors 2022.
