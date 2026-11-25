@@ -2,7 +2,7 @@
 
 Sketch, diagram and present right inside your notes. Quick Sketch adds a drawing editor to Obsidian that works with a mouse, a trackpad, or an Apple Pencil, and saves every drawing as a plain SVG file that embeds in your notes like any other image.
 
-<!-- Add a screenshot here, e.g. ![Quick Sketch](./images/screenshot.png) -->
+![Quick Sketch: handwriting, a highlighter, and a small flowchart on lined paper, with the laser pointer selected](./images/cover.png)
 
 ## Features
 
