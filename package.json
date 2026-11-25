@@ -1,6 +1,6 @@
 {
 	"name": "quick-sketch",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"description": "Sketch, diagram and present right inside your notes, with Apple Pencil support, shapes and arrows, a laser pointer, and PNG, SVG and PDF export.",
 	"main": "main.js",
 	"scripts": {
