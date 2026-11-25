@@ -110,7 +110,7 @@ export function encodePressure(points: PressurePoint[]): string {
 /** Attaches pressures decoded from `encoded` to `points` (in place). */
 export function decodePressure(encoded: string, points: PressurePoint[]): void {
 	for (let i = 0; i < points.length; i++) {
-		const v = parseInt(encoded.substr(i * 2, 2), 10);
+		const v = parseInt(encoded.slice(i * 2, i * 2 + 2), 10);
 		points[i].p = Number.isFinite(v) ? v / 99 : 0.5;
 	}
 }

@@ -99,6 +99,7 @@
 }
 
 .qs-style-panel.is-dragging {
+	right: auto;
 	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
 	opacity: 0.95;
 }
@@ -366,6 +367,16 @@
 	   stylus contact as its own pan/zoom gesture. */
 	touch-action: none;
 	background-color: #ffffff;
+	transform-origin: 0 0;
+}
+
+/* Off-screen SVG used to measure content while the view is hidden. */
+.quick-sketch-measure-probe {
+	position: fixed;
+	left: -10000px;
+	top: 0;
+	visibility: hidden;
+	pointer-events: none;
 }
 
 .quick-sketch-canvas-wrap.tool-pencil .quick-sketch-canvas,

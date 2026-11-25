@@ -62,7 +62,7 @@ import type QuickSketchPlugin from "./main";
 import { recognizeShape } from "./recognize";
 import { saveExport } from "./save";
 
-const SVG_NS = "http://www.w3.org/2000/svg";
+const SVG_NS = "http://www.w3.org/2000/svg" as const;
 // Autosave waits for a real pause: a save (serializing the SVG, writing the
 // file -- possibly to iCloud -- and refreshing embeds in open notes) is main-
 // thread work, and with a short debounce it lands in the natural gaps between
@@ -109,7 +109,6 @@ interface Point {
  * but is kept so triangles in older files still load and render. */
 /** An "image" is a pasted/inserted picture, handled as a box like the shapes. */
 type ShapeKind = "rectangle" | "ellipse" | "diamond" | "triangle" | "arrow" | "image";
-type ElementKind = "freehand" | ShapeKind | "text";
 
 interface FreehandElement {
 	id: string;
@@ -312,7 +311,7 @@ const LABEL_MIN_FONT = 4;
 
 let measureCtx: CanvasRenderingContext2D | null = null;
 function measureText(text: string, fontSize: number): number {
-	if (!measureCtx) measureCtx = document.createElement("canvas").getContext("2d");
+	if (!measureCtx) measureCtx = createEl("canvas").getContext("2d");
 	if (!measureCtx) return text.length * fontSize * 0.55;
 	measureCtx.font = `${fontSize}px sans-serif`;
 	return measureCtx.measureText(text).width;
@@ -614,7 +613,7 @@ function dashArray(dash: DashStyle | undefined, size: number): string | null {
 async function loadImageFile(file: File): Promise<{ href: string; width: number; height: number }> {
 	const original = await new Promise<string>((resolve, reject) => {
 		const reader = new FileReader();
-		reader.onload = () => resolve(String(reader.result));
+		reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
 		reader.onerror = () => reject(new Error("Couldn't read the image."));
 		reader.readAsDataURL(file);
 	});
@@ -628,7 +627,7 @@ async function loadImageFile(file: File): Promise<{ href: string; width: number;
 	const h = img.naturalHeight || 200;
 	const scale = Math.min(1, IMAGE_MAX_PX / Math.max(w, h));
 	if (scale === 1 || file.type === "image/svg+xml") return { href: original, width: w, height: h };
-	const canvas = document.createElement("canvas");
+	const canvas = createEl("canvas");
 	canvas.width = Math.round(w * scale);
 	canvas.height = Math.round(h * scale);
 	const ctx = canvas.getContext("2d");
@@ -681,7 +680,7 @@ function isClosedShape(e: DrawnElement): e is ShapeElement {
 /** Parses SVG markup we wrote ourselves (static, built from numbers only)
  * into an element -- without innerHTML. The markup needs its xmlns. */
 function parseSvg(markup: string): Element {
-	return document.importNode(new DOMParser().parseFromString(markup, "image/svg+xml").documentElement, true);
+	return activeDocument.importNode(new DOMParser().parseFromString(markup, "image/svg+xml").documentElement, true);
 }
 
 /** Toolbar glyphs (see parseSvg). */
@@ -845,10 +844,10 @@ export class DrawingView extends ItemView {
 			this.applyToolClass();
 		});
 		this.registerDomEvent(window, "paste", (e) => this.handlePaste(e));
-		this.registerDomEvent(document, "fullscreenchange", () => {
+		this.registerDomEvent(this.contentEl.doc, "fullscreenchange", () => {
 			if (!this.presenting) return;
 			// Entered full screen: refit to the new size. Left it (Esc): stop.
-			if (document.fullscreenElement === this.contentEl) requestAnimationFrame(() => this.fitToContent());
+			if (this.contentEl.doc.fullscreenElement === this.contentEl) window.requestAnimationFrame(() => this.fitToContent());
 			else this.exitPresentation();
 		});
 		if (this.filePath) {
@@ -899,16 +898,15 @@ export class DrawingView extends ItemView {
 		const canvasWrap = container.createDiv({ cls: "quick-sketch-canvas-wrap" });
 		this.canvasWrapEl = canvasWrap;
 
-		this.svgEl = document.createElementNS(SVG_NS, "svg") as SVGSVGElement;
+		this.svgEl = activeDocument.createElementNS(SVG_NS, "svg");
 		this.svgEl.setAttribute("width", String(WORKSPACE_SIZE));
 		this.svgEl.setAttribute("height", String(WORKSPACE_SIZE));
 		this.svgEl.classList.add("quick-sketch-canvas");
-		this.svgEl.style.transformOrigin = "0 0";
 
-		this.elementsGroup = document.createElementNS(SVG_NS, "g") as SVGGElement;
+		this.elementsGroup = activeDocument.createElementNS(SVG_NS, "g");
 		this.svgEl.appendChild(this.elementsGroup);
 
-		this.overlayGroup = document.createElementNS(SVG_NS, "g") as SVGGElement;
+		this.overlayGroup = activeDocument.createElementNS(SVG_NS, "g");
 		this.overlayGroup.classList.add("quick-sketch-overlay");
 		this.svgEl.appendChild(this.overlayGroup);
 
@@ -1256,7 +1254,7 @@ export class DrawingView extends ItemView {
 		this.styleDockEl.toggle(!!ctx);
 		if (!ctx) return;
 		// Its height depends on the tool; keep it inside the editor.
-		requestAnimationFrame(() => this.placeDock());
+		window.requestAnimationFrame(() => this.placeDock());
 
 		// Sections are stacked with a divider between them; the narrow
 		// column has no room for titles, so they're tooltips.
@@ -1425,11 +1423,10 @@ export class DrawingView extends ItemView {
 			dock.addClass("is-dragging");
 			const move = (evt: PointerEvent) => {
 				if (evt.pointerId !== down.pointerId) return;
-				// "auto", not "": the stylesheet's default `right` would
-				// otherwise still apply and stretch the panel.
-				dock.style.right = "auto";
-				dock.style.left = `${evt.clientX - host.left - grabX}px`;
-				dock.style.top = `${evt.clientY - host.top - grabY}px`;
+				// Drop the placed `right`; while dragging, the stylesheet pins
+				// it to auto so the panel doesn't stretch.
+				dock.style.removeProperty("right");
+				dock.setCssProps({ left: `${evt.clientX - host.left - grabX}px`, top: `${evt.clientY - host.top - grabY}px` });
 			};
 			const drop = (evt: PointerEvent) => {
 				if (evt.pointerId !== down.pointerId) return;
@@ -1473,10 +1470,7 @@ export class DrawingView extends ItemView {
 		const side = pos?.side ?? "right";
 		const top = Math.max(margin, Math.min(pos?.y ?? 58, hostH - 120));
 		const x = Math.max(margin, Math.min(pos?.x ?? margin, hostW - dock.offsetWidth - margin));
-		dock.style.top = `${top}px`;
-		dock.style.left = side === "left" ? `${x}px` : "auto";
-		dock.style.right = side === "right" ? `${x}px` : "auto";
-		dock.style.maxHeight = `${Math.max(120, hostH - top - margin)}px`;
+		dock.setCssProps({ top: `${top}px`, left: side === "left" ? `${x}px` : "auto", right: side === "right" ? `${x}px` : "auto", "max-height": `${Math.max(120, hostH - top - margin)}px` });
 	}
 
 	onResize(): void {
@@ -1752,7 +1746,7 @@ export class DrawingView extends ItemView {
 		if (pressure) p.p = penPressure(evt);
 		const color = highlight ? this.currentHighlightColor : this.currentColor;
 		const size = highlight ? this.currentHighlightSize * HIGHLIGHT_SIZE_MULTIPLIER : this.currentSize;
-		const pathEl = document.createElementNS(SVG_NS, "path") as SVGPathElement;
+		const pathEl = activeDocument.createElementNS(SVG_NS, "path");
 		this.styleFreehandPath(pathEl, color, size, highlight, pressure);
 		pathEl.setAttribute("d", freehandPathData([p], size, pressure));
 		this.insertPath(pathEl, highlight);
@@ -1868,7 +1862,7 @@ export class DrawingView extends ItemView {
 			end: "move",
 		};
 		const cursor = handle ? cursors[handle] : "";
-		if (this.svgEl.style.cursor !== cursor) this.svgEl.style.cursor = cursor;
+		if (this.svgEl.style.getPropertyValue("cursor") !== cursor) this.svgEl.setCssProps({ cursor });
 	}
 
 	private onPointerUp = (evt: PointerEvent): void => {
@@ -2119,10 +2113,7 @@ export class DrawingView extends ItemView {
 
 		const ta = this.canvasWrapEl.createEl("textarea", { cls: "quick-sketch-text-input" });
 		ta.rows = 1;
-		ta.style.left = `${wrapPt.x}px`;
-		ta.style.top = `${wrapPt.y}px`;
-		ta.style.fontSize = `${fontSize * this.zoom}px`;
-		ta.style.color = this.currentColor;
+		ta.setCssProps({ left: `${wrapPt.x}px`, top: `${wrapPt.y}px`, "font-size": `${fontSize * this.zoom}px`, color: this.currentColor });
 
 		this.textEditor = ta;
 		this.textEditorCanvasPoint = canvasPt;
@@ -2140,13 +2131,10 @@ export class DrawingView extends ItemView {
 		if (elem.kind === "arrow") ta.addClass("is-arrow");
 		ta.rows = 1;
 		ta.value = elem.label ?? "";
-		ta.style.left = `${anchor.x * this.zoom + this.panX}px`;
-		ta.style.top = `${anchor.y * this.zoom + this.panY}px`;
-		ta.style.fontSize = `${fontSize * this.zoom}px`;
-		ta.style.color = elem.fill === "solid" ? contrastColor(elem.color) : elem.color;
+		ta.setCssProps({ left: `${anchor.x * this.zoom + this.panX}px`, top: `${anchor.y * this.zoom + this.panY}px`, "font-size": `${fontSize * this.zoom}px`, color: elem.fill === "solid" ? contrastColor(elem.color) : elem.color });
 		if (elem.kind !== "arrow") {
 			// Match the width the label will wrap to inside the shape.
-			ta.style.width = `${Math.max(60, this.labelBox(elem).width * this.zoom)}px`;
+			ta.setCssProps({ width: `${Math.max(60, this.labelBox(elem).width * this.zoom)}px` });
 		}
 		// Hide the rendered label while editing so it doesn't show twice.
 		elem.labelEl?.setAttribute("visibility", "hidden");
@@ -2156,7 +2144,7 @@ export class DrawingView extends ItemView {
 		this.textEditorTarget = elem;
 		this.attachTextEditorHandlers(ta);
 		window.setTimeout(() => {
-			ta.style.height = `${ta.scrollHeight}px`;
+			ta.setCssProps({ height: `${ta.scrollHeight}px` });
 			ta.select();
 		}, 0);
 	}
@@ -2172,10 +2160,7 @@ export class DrawingView extends ItemView {
 		const ta = this.canvasWrapEl.createEl("textarea", { cls: "quick-sketch-text-input" });
 		ta.rows = 1;
 		ta.value = elem.text;
-		ta.style.left = `${top.x * this.zoom + this.panX}px`;
-		ta.style.top = `${top.y * this.zoom + this.panY}px`;
-		ta.style.fontSize = `${elem.size * this.zoom}px`;
-		ta.style.color = elem.color;
+		ta.setCssProps({ left: `${top.x * this.zoom + this.panX}px`, top: `${top.y * this.zoom + this.panY}px`, "font-size": `${elem.size * this.zoom}px`, color: elem.color });
 		// Hide the rendered text while editing so it doesn't show twice.
 		elem.el.setAttribute("visibility", "hidden");
 
@@ -2184,16 +2169,16 @@ export class DrawingView extends ItemView {
 		this.textEditorTarget = elem;
 		this.attachTextEditorHandlers(ta);
 		window.setTimeout(() => {
-			ta.style.width = `${Math.max(60, ta.scrollWidth + 2)}px`;
-			ta.style.height = `${ta.scrollHeight}px`;
+			ta.setCssProps({ width: `${Math.max(60, ta.scrollWidth + 2)}px`, height: `${ta.scrollHeight}px` });
 			ta.select();
 		}, 0);
 	}
 
 	private attachTextEditorHandlers(ta: HTMLTextAreaElement): void {
 		const autoGrow = () => {
-			ta.style.height = "auto";
-			ta.style.height = `${ta.scrollHeight}px`;
+			// Back to the intrinsic height (no stylesheet height), then fit.
+			ta.style.removeProperty("height");
+			ta.setCssProps({ height: `${ta.scrollHeight}px` });
 		};
 		ta.addEventListener("input", autoGrow);
 		ta.addEventListener("keydown", (e) => {
@@ -2595,7 +2580,7 @@ export class DrawingView extends ItemView {
 		this.handles = [];
 		const z = this.zoom;
 		const add = (tag: string, attrs: Record<string, string | number>, cls: string): SVGElement => {
-			const el = document.createElementNS(SVG_NS, tag) as SVGElement;
+			const el = activeDocument.createElementNS(SVG_NS, tag);
 			for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
 			el.classList.add(cls);
 			this.overlayGroup.appendChild(el);
@@ -2963,7 +2948,7 @@ export class DrawingView extends ItemView {
 	private requestLaserFrame(): void {
 		const laser = this.laser;
 		if (!laser || laser.rafId !== null) return;
-		laser.rafId = requestAnimationFrame(() => {
+		laser.rafId = window.requestAnimationFrame(() => {
 			laser.rafId = null;
 			this.drawLaser();
 		});
@@ -3055,7 +3040,7 @@ export class DrawingView extends ItemView {
 	private clearLaser(): void {
 		const laser = this.laser;
 		if (!laser) return;
-		if (laser.rafId !== null) cancelAnimationFrame(laser.rafId);
+		if (laser.rafId !== null) window.cancelAnimationFrame(laser.rafId);
 		if (laser.pointerId !== null) this.releaseCapture(laser.pointerId);
 		laser.canvas.remove();
 		this.laser = null;
@@ -3166,7 +3151,7 @@ export class DrawingView extends ItemView {
 	}
 
 	private applyTransform(): void {
-		this.svgEl.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+		this.svgEl.setCssProps({ "transform": `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})` });
 		// Handles keep a constant on-screen size, so they're redrawn on zoom.
 		if (this.selection.size > 0) this.renderSelectionOverlay();
 		this.showZoom();
@@ -3382,7 +3367,7 @@ export class DrawingView extends ItemView {
 
 	toggleDiagnostics(): void {
 		if (this.diag) {
-			cancelAnimationFrame(this.diag.rafId);
+			window.cancelAnimationFrame(this.diag.rafId);
 			this.diag.el.remove();
 			this.diag = null;
 			return;
@@ -3430,9 +3415,9 @@ export class DrawingView extends ItemView {
 					`elements ${this.elements.length}  zoom ${Math.round(this.zoom * 100)}%`,
 				].join("\n")
 			);
-			d.rafId = requestAnimationFrame(tick);
+			d.rafId = window.requestAnimationFrame(tick);
 		};
-		this.diag.rafId = requestAnimationFrame(tick);
+		this.diag.rafId = window.requestAnimationFrame(tick);
 	}
 
 	private markDirtyAndScheduleSave(): void {
@@ -3502,8 +3487,7 @@ export class DrawingView extends ItemView {
 	private measureContent(): DOMRect {
 		const live = this.elementsGroup.getBBox();
 		if (live.width > 0 || live.height > 0 || this.elements.length === 0) return live;
-		const probe = document.body.createSvg("svg", { attr: { width: "1", height: "1" } });
-		probe.setCssStyles({ position: "fixed", left: "-10000px", top: "0", visibility: "hidden", pointerEvents: "none" });
+		const probe = activeDocument.body.createSvg("svg", { cls: "quick-sketch-measure-probe", attr: { width: "1", height: "1" } });
 		try {
 			return probe.appendChild(this.elementsGroup.cloneNode(true) as SVGGElement).getBBox();
 		} finally {
@@ -3525,7 +3509,7 @@ export class DrawingView extends ItemView {
 		const width = hasContent ? bbox.width + CROP_PADDING * 2 : EMPTY_EXPORT_WIDTH;
 		const height = hasContent ? bbox.height + CROP_PADDING * 2 : EMPTY_EXPORT_HEIGHT;
 
-		const exportSvg = document.createElementNS(SVG_NS, "svg") as SVGSVGElement;
+		const exportSvg = activeDocument.createElementNS(SVG_NS, "svg");
 		exportSvg.setAttribute("xmlns", SVG_NS);
 		exportSvg.setAttribute("viewBox", `${fmt(x)} ${fmt(y)} ${fmt(width)} ${fmt(height)}`);
 		exportSvg.setAttribute("width", String(Math.round(width)));
@@ -3556,14 +3540,14 @@ export class DrawingView extends ItemView {
 		}
 
 		if (this.paper !== "none" && this.plugin.settings.paperInExport) {
-			const bg = document.createElementNS(SVG_NS, "rect");
+			const bg = activeDocument.createElementNS(SVG_NS, "rect");
 			bg.setAttribute("data-paper-bg", "true");
 			bg.setAttribute("x", fmt(x));
 			bg.setAttribute("y", fmt(y));
 			bg.setAttribute("width", fmt(width));
 			bg.setAttribute("height", fmt(height));
 			bg.setAttribute("fill", "url(#qs-paper)");
-			const defs = document.createElementNS(SVG_NS, "defs");
+			const defs = activeDocument.createElementNS(SVG_NS, "defs");
 			defs.appendChild(parseSvg(`<svg xmlns="${SVG_NS}">${paperPattern(this.paper)}</svg>`).firstElementChild as Element);
 			exportSvg.prepend(defs, bg);
 		}
@@ -3723,7 +3707,7 @@ export class DrawingView extends ItemView {
 			textEl.setAttribute("font-size", fmt(fontSize));
 			textEl.replaceChildren();
 			for (const line of lines) {
-				const tspan = document.createElementNS(SVG_NS, "tspan");
+				const tspan = activeDocument.createElementNS(SVG_NS, "tspan");
 				tspan.textContent = line;
 				textEl.appendChild(tspan);
 			}
@@ -3770,14 +3754,14 @@ export class DrawingView extends ItemView {
 		}
 
 		if (!elem.labelGroup) {
-			const g = document.createElementNS(SVG_NS, "g") as SVGGElement;
+			const g = activeDocument.createElementNS(SVG_NS, "g");
 			g.setAttribute("data-kind", "labeled");
 			if (elem.el.parentNode) elem.el.replaceWith(g);
 			else this.elementsGroup.appendChild(g);
 			g.appendChild(elem.el);
 			elem.labelGroup = g;
 		}
-		const textEl = document.createElementNS(SVG_NS, "text") as SVGTextElement;
+		const textEl = activeDocument.createElementNS(SVG_NS, "text");
 		textEl.setAttribute("data-label", "true");
 		textEl.setAttribute("data-label-size", String(baseSize));
 		// Text on a solid fill needs to contrast with the fill, not match it.
@@ -3794,7 +3778,7 @@ export class DrawingView extends ItemView {
 	}
 
 	private applyArrowGeometry(elem: ShapeElement): void {
-		const g = elem.el as SVGGElement;
+		const g = elem.el;
 		const line = g.querySelector("line");
 		if (!line) return;
 		line.setAttribute("x1", fmt(elem.x0));
@@ -3815,7 +3799,7 @@ export class DrawingView extends ItemView {
 		const want = heads === "none" ? 0 : heads === "end" ? 1 : 2;
 		const polys = Array.from(g.querySelectorAll("polygon"));
 		while (polys.length < want) {
-			const head = document.createElementNS(SVG_NS, "polygon") as SVGPolygonElement;
+			const head = activeDocument.createElementNS(SVG_NS, "polygon");
 			head.setAttribute("fill", elem.color);
 			g.appendChild(head);
 			polys.push(head);
@@ -3844,7 +3828,7 @@ export class DrawingView extends ItemView {
 		highlight = false
 	): FreehandElement {
 		const pressure = !highlight && points.some((p) => p.p !== undefined);
-		const pathEl = document.createElementNS(SVG_NS, "path") as SVGPathElement;
+		const pathEl = activeDocument.createElementNS(SVG_NS, "path");
 		this.styleFreehandPath(pathEl, color, size, highlight, pressure);
 		this.insertPath(pathEl, highlight);
 		const elem: FreehandElement = { id: id ?? newElementId(), kind: "freehand", el: pathEl, color, size, points, highlight, pressure: pressure || undefined };
@@ -3856,24 +3840,24 @@ export class DrawingView extends ItemView {
 		const { kind, color, size } = data;
 		let el: SVGGraphicsElement;
 		if (kind === "rectangle") {
-			el = document.createElementNS(SVG_NS, "rect") as SVGRectElement;
+			el = activeDocument.createElementNS(SVG_NS, "rect");
 			el.setAttribute("stroke", color);
 			el.setAttribute("stroke-width", String(size));
 			el.setAttribute("fill", "none");
 			el.setAttribute("stroke-linejoin", "round");
 		} else if (kind === "ellipse") {
-			el = document.createElementNS(SVG_NS, "ellipse") as SVGEllipseElement;
+			el = activeDocument.createElementNS(SVG_NS, "ellipse");
 			el.setAttribute("stroke", color);
 			el.setAttribute("stroke-width", String(size));
 			el.setAttribute("fill", "none");
 		} else if (kind === "diamond" || kind === "triangle") {
-			el = document.createElementNS(SVG_NS, "polygon") as SVGPolygonElement;
+			el = activeDocument.createElementNS(SVG_NS, "polygon");
 			el.setAttribute("stroke", color);
 			el.setAttribute("stroke-width", String(size));
 			el.setAttribute("fill", "none");
 			el.setAttribute("stroke-linejoin", "round");
 		} else if (kind === "image") {
-			el = document.createElementNS(SVG_NS, "image") as SVGImageElement;
+			el = activeDocument.createElementNS(SVG_NS, "image");
 			el.setAttribute("href", data.href ?? "");
 			// The box is the image's size; resizing it stretches the picture.
 			el.setAttribute("preserveAspectRatio", "none");
@@ -3882,9 +3866,9 @@ export class DrawingView extends ItemView {
 			// <polygon>, rather than an SVG <marker> -- avoids marker/defs
 			// bookkeeping and keeps the arrowhead's angle trivially correct at
 			// any orientation.
-			const g = document.createElementNS(SVG_NS, "g") as SVGGElement;
+			const g = activeDocument.createElementNS(SVG_NS, "g");
 			g.setAttribute("data-kind", "arrow");
-			const line = document.createElementNS(SVG_NS, "line") as SVGLineElement;
+			const line = activeDocument.createElementNS(SVG_NS, "line");
 			line.setAttribute("stroke", color);
 			line.setAttribute("stroke-width", String(size));
 			line.setAttribute("stroke-linecap", "round");
@@ -3938,7 +3922,7 @@ export class DrawingView extends ItemView {
 	}
 
 	private createTextElement(color: string, fontSize: number, x: number, y: number, text: string, id?: string): TextElement {
-		const textEl = document.createElementNS(SVG_NS, "text") as SVGTextElement;
+		const textEl = activeDocument.createElementNS(SVG_NS, "text");
 		textEl.setAttribute("fill", color);
 		textEl.setAttribute("font-size", String(fontSize));
 		textEl.setAttribute("font-family", "sans-serif");
@@ -3956,7 +3940,7 @@ export class DrawingView extends ItemView {
 		elem.text = text;
 		elem.el.replaceChildren();
 		for (const line of text.split("\n")) {
-			const tspan = document.createElementNS(SVG_NS, "tspan");
+			const tspan = activeDocument.createElementNS(SVG_NS, "tspan");
 			tspan.setAttribute("x", fmt(elem.x));
 			tspan.setAttribute("dy", elem.el.childElementCount === 0 ? "0" : "1.2em");
 			tspan.textContent = line;
@@ -4068,8 +4052,8 @@ export class DrawingView extends ItemView {
 				const dataPoints = points.length === 0 ? child.getAttribute("data-points") : null;
 				if (dataPoints) {
 					try {
-						const parsed = JSON.parse(dataPoints);
-						if (Array.isArray(parsed)) points = parsed;
+						const parsed: unknown = JSON.parse(dataPoints);
+						if (Array.isArray(parsed)) points = parsed as Point[];
 					} catch {
 						points = [];
 					}
@@ -4412,7 +4396,7 @@ export class DrawingView extends ItemView {
 		if (Platform.isDesktopApp && this.contentEl.requestFullscreen) {
 			this.contentEl.requestFullscreen().catch(() => undefined);
 		}
-		requestAnimationFrame(() => this.fitToContent());
+		window.requestAnimationFrame(() => this.fitToContent());
 	}
 
 	private exitPresentation(): void {
@@ -4421,7 +4405,7 @@ export class DrawingView extends ItemView {
 		this.contentEl.removeClass("qs-presenting");
 		this.presentExitEl?.remove();
 		this.presentExitEl = null;
-		if (document.fullscreenElement === this.contentEl) document.exitFullscreen().catch(() => undefined);
+		if (this.contentEl.doc.fullscreenElement === this.contentEl) this.contentEl.doc.exitFullscreen().catch(() => undefined);
 		this.setTool(this.toolBeforePresenting ?? DEFAULT_TOOL);
 		this.toolBeforePresenting = null;
 	}
@@ -4433,7 +4417,7 @@ export class DrawingView extends ItemView {
 	 * content has drifted from that point -- which reads as the drawing
 	 * "moving away" and any new strokes landing in a big empty gap next to it. */
 	private centerView(): void {
-		requestAnimationFrame(() => {
+		window.requestAnimationFrame(() => {
 			const wrap = this.canvasWrapEl;
 			if (!wrap) return;
 			this.zoom = 1;

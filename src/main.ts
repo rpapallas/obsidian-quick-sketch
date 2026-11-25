@@ -73,7 +73,7 @@ export default class QuickSketchPlugin extends Plugin {
 		// the note renders (slow iCloud loads on iPad, CodeMirror recreating
 		// widgets on scroll), which would wipe a one-shot button.
 		this.app.workspace.onLayoutReady(() => {
-			this.observeForEmbeds(document);
+			this.observeForEmbeds(this.app.workspace.containerEl.doc);
 			this.scheduleEmbedScan();
 		});
 		this.registerEvent(this.app.workspace.on("window-open", (win) => this.observeForEmbeds(win.doc)));
@@ -104,7 +104,7 @@ export default class QuickSketchPlugin extends Plugin {
 		// Saved values over the defaults; anything missing or of the wrong
 		// shape (from an older version, or a hand-edited data.json) falls
 		// back to its default.
-		const saved: Partial<QuickSketchSettings> = (await this.loadData()) ?? {};
+		const saved = ((await this.loadData()) as Partial<QuickSketchSettings> | null) ?? {};
 		const colors = saved.customColors;
 		this.settings = {
 			...DEFAULT_SETTINGS,
@@ -161,7 +161,7 @@ export default class QuickSketchPlugin extends Plugin {
 			active: true,
 			state: { file: file.path },
 		});
-		this.app.workspace.revealLeaf(leaf);
+		await this.app.workspace.revealLeaf(leaf);
 	}
 
 	/**
@@ -223,7 +223,7 @@ export default class QuickSketchPlugin extends Plugin {
 			// Ignore the drawing view's own churn (a new <path> per stroke)
 			// so scans never compete with ink while writing.
 			const relevant = records.some((r) => {
-				const el = r.target instanceof Element ? r.target : r.target.parentElement;
+				const el = r.target.instanceOf(Element) ? r.target : r.target.parentElement;
 				return !el?.closest(`[data-type="${VIEW_TYPE_DRAWING}"]`);
 			});
 			if (relevant) this.scheduleEmbedScan();
@@ -241,7 +241,7 @@ export default class QuickSketchPlugin extends Plugin {
 	private scheduleEmbedScan(): void {
 		if (this.embedScanQueued) return;
 		this.embedScanQueued = true;
-		requestAnimationFrame(() => {
+		window.requestAnimationFrame(() => {
 			this.embedScanQueued = false;
 			this.scanEmbeds();
 		});

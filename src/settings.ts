@@ -123,7 +123,7 @@ export class QuickSketchSettingTab extends PluginSettingTab {
 		new Setting(containerEl).setName("Defaults").setHeading();
 
 		new Setting(containerEl).setName("Tool").setDesc("The tool selected when a drawing opens.").addDropdown((d) => {
-			for (const [tool, name] of Object.entries(TOOL_NAMES)) d.addOption(tool, name as string);
+			for (const [tool, name] of Object.entries(TOOL_NAMES)) d.addOption(tool, name);
 			d.setValue(s.defaultTool).onChange((v) => {
 				s.defaultTool = v as Tool;
 				save();
